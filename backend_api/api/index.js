@@ -32,8 +32,8 @@ function isEmailOtpConfigured() {
 async function sendRealOtpEmail({ to, code, purpose, recipientName = '' }) {
   const subject =
     purpose === 'register'
-      ? `VeriLens AI — Verify Your Email (OTP: ${code})`
-      : `VeriLens AI — Password Reset OTP (${code})`;
+      ? `VeriLens AI â€” Verify Your Email (OTP: ${code})`
+      : `VeriLens AI â€” Password Reset OTP (${code})`;
   const heading =
     purpose === 'register'
       ? 'Verify Your VeriLens AI Account'
@@ -109,13 +109,29 @@ function signPayload(payload) {
 }
 
 function verifyToken(token) {
-  if (!token || !token.includes('.')) return null;
-  const [data, sig] = token.split('.');
-  const expected = crypto.createHmac('sha256', authSecret).update(data).digest('base64url');
-  if (sig !== expected) return null;
-  const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
-  if (parsed.exp && Date.now() > parsed.exp) return null;
-  return parsed;
+  try {
+    if (!token || !token.includes('.')) return null;
+    const [data, sig] = token.split('.');
+    const expected = crypto.createHmac('sha256', authSecret).update(data).digest('base64url');
+    if (sig !== expected) return null;
+    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    if (parsed.exp && Date.now() > parsed.exp) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function makeAccountProof(userDoc) {
+  return signPayload({
+    purpose: 'account-proof',
+    id: userDoc.id,
+    name: userDoc.name,
+    email: userDoc.email,
+    role: userDoc.role,
+    passwordHash: userDoc.passwordHash,
+    exp: Date.now() + 365 * 86400000,
+  });
 }
 
 async function getDb() {
@@ -257,7 +273,7 @@ function inspectVoiceForensics({ audioBase64, fileName = '', mimeType = 'audio/w
         'Mid-band formant smoothing detected under compression noise',
       ],
       textConsistency: 'Urgent financial/emergency request cannot be verified from compressed audio alone.',
-      cumoNote: 'Marked Suspicious — verify caller identity independently.',
+      cumoNote: 'Marked Suspicious â€” verify caller identity independently.',
     };
   }
 
@@ -382,7 +398,12 @@ app.post('/api/auth/register', async (req, res) => {
       memoryUsers.set(cleanEmail, userDoc);
     }
     const safeUser = { id: userDoc.id, name: userDoc.name, email: userDoc.email, role: userDoc.role };
-    res.json({ ok: true, user: safeUser, token: signPayload({ ...safeUser, exp: Date.now() + 7 * 86400000 }) });
+    res.json({
+      ok: true,
+      user: safeUser,
+      token: signPayload({ ...safeUser, exp: Date.now() + 7 * 86400000 }),
+      accountProof: makeAccountProof(userDoc),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -390,24 +411,63 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email = '', password = '' } = req.body || {};
+    const { email = '', password = '', accountProof = '' } = req.body || {};
     const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
     const passHash = hashPassword(password);
     const db = await getDb();
-    const user = db
+    let user = db
       ? await db.collection('users').findOne({ email: cleanEmail })
       : memoryUsers.get(cleanEmail);
 
-    if (!user || user.passwordHash !== passHash) {
+    if (!user && accountProof) {
+      const proof = verifyToken(accountProof);
+      if (proof && proof.purpose === 'account-proof' && proof.email === cleanEmail && proof.passwordHash) {
+        user = {
+          id: proof.id || `usr_${Date.now()}`,
+          name: proof.name || cleanEmail.split('@')[0],
+          email: cleanEmail,
+          role: proof.role || 'Media Analyst',
+          passwordHash: proof.passwordHash,
+          createdAt: new Date().toISOString(),
+        };
+        if (db) {
+          await db.collection('users').updateOne(
+            { email: cleanEmail },
+            { $setOnInsert: user },
+            { upsert: true }
+          );
+        } else {
+          memoryUsers.set(cleanEmail, user);
+        }
+      }
+    }
+
+    if (!user) {
+      return res.status(401).json({
+        error: db
+          ? 'No account found for this email. Please Register first.'
+          : 'Account session expired on serverless RAM (MongoDB URI not set). Tap Forgot Password once or set MONGODB_URI for permanent cloud storage.',
+      });
+    }
+
+    if (user.passwordHash !== passHash) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
+
     const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role };
-    res.json({ ok: true, user: safeUser, token: signPayload({ ...safeUser, exp: Date.now() + 7 * 86400000 }) });
+    res.json({
+      ok: true,
+      user: safeUser,
+      token: signPayload({ ...safeUser, exp: Date.now() + 7 * 86400000 }),
+      accountProof: makeAccountProof(user),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const cleanEmail = (req.body?.email || '').trim().toLowerCase();
@@ -458,19 +518,44 @@ app.post('/api/auth/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 6 characters.' });
     }
     usedOtpNonces.add(verified.nonce);
-    const newHash = hashPassword(newPassword);
+        const newHash = hashPassword(newPassword);
     const db = await getDb();
+    let updatedUser = null;
     if (db) {
       await db.collection('users').updateOne(
         { email: cleanEmail },
-        { $set: { passwordHash: newHash } }
+        {
+          $set: { passwordHash: newHash },
+          $setOnInsert: {
+            id: `usr_${Date.now()}`,
+            name: cleanEmail.split('@')[0],
+            email: cleanEmail,
+            role: 'Media Analyst',
+            verifiedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
       );
-    } else if (memoryUsers.has(cleanEmail)) {
-      const existing = memoryUsers.get(cleanEmail);
+      updatedUser = await db.collection('users').findOne({ email: cleanEmail });
+    } else {
+      const existing = memoryUsers.get(cleanEmail) || {
+        id: `usr_${Date.now()}`,
+        name: cleanEmail.split('@')[0],
+        email: cleanEmail,
+        role: 'Media Analyst',
+        verifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+      };
       existing.passwordHash = newHash;
       memoryUsers.set(cleanEmail, existing);
+      updatedUser = existing;
     }
-    res.json({ ok: true, message: 'Password updated successfully.' });
+    res.json({
+      ok: true,
+      message: 'Password updated successfully.',
+      accountProof: updatedUser ? makeAccountProof(updatedUser) : '',
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

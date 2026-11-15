@@ -281,32 +281,28 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _pickAudioFile() async {
     setState(() => _errorMessage = null);
-    if (!kIsWeb) {
+    try {
+      final picked = await pickAudioFromPlatform();
+      if (picked != null && mounted) {
+        setState(() {
+          _selectedAudioBytes = picked.bytes;
+          _selectedAudioName = picked.fileName;
+          _selectedAudioMime = picked.mimeType;
+          _audioSizeKb = (picked.bytes.length / 1024).round();
+          _voiceResult = null;
+        });
+      }
+    } catch (err) {
+      if (!mounted) return;
       setState(() => _errorMessage =
-          'Use the 1-tap Voice Deepfake test presets below on Android, or upload MP3/WAV directly on Chrome Desktop.');
-      return;
-    }
-    final picked = await pickAudioFromWeb();
-    if (picked != null && mounted) {
-      setState(() {
-        _selectedAudioBytes = picked.bytes;
-        _selectedAudioName = picked.fileName;
-        _selectedAudioMime = picked.mimeType;
-        _audioSizeKb = (picked.bytes.length / 1024).round();
-        _voiceResult = null;
-      });
+          'Audio upload error: ${err.toString().replaceFirst('Exception: ', '')}');
     }
   }
 
   Future<void> _recordVoice() async {
     setState(() => _errorMessage = null);
-    if (!kIsWeb) {
-      setState(() => _errorMessage =
-          'Live microphone recording works in Chrome Desktop. On Android, use the Voice Test presets below.');
-      return;
-    }
     try {
-      final recorded = await recordVoiceFromWeb(context);
+      final recorded = await recordVoiceFromPlatform(context);
       if (recorded != null && mounted) {
         setState(() {
           _selectedAudioBytes = recorded.bytes;
@@ -322,7 +318,6 @@ class _HomeScreenState extends State<HomeScreen> {
           'Mic error: ${err.toString().replaceFirst('Exception: ', '')}');
     }
   }
-
   Future<void> _runImageAnalysis({
     String sourceChannel = 'Mobile App',
     String? overrideDescription,
@@ -1050,7 +1045,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ),
                                     SizedBox(height: 4),
                                     Text(
-                                      'Supports JPEG, PNG, WebP · EXIF & AI pixel checks',
+                                      'Supports JPEG, PNG, WebP Â· EXIF & AI pixel checks',
                                       style: TextStyle(
                                           fontSize: 12,
                                           color: Color(0xFF64748B)),
@@ -1092,7 +1087,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               borderRadius: BorderRadius.circular(20),
                             ),
                             child: Text(
-                              '${_imageResult!.classification.toUpperCase()} · ${_imageResult!.confidence}%',
+                              '${_imageResult!.classification.toUpperCase()} Â· ${_imageResult!.confidence}%',
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.w800,
@@ -1161,7 +1156,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'Attached: $_selectedImageName · $_imageSizeKb KB · Ready to Analyze',
+                            'Attached: $_selectedImageName Â· $_imageSizeKb KB Â· Ready to Analyze',
                             style: const TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w500,
@@ -1337,7 +1332,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             Text(
                               _selectedAudioBytes == null
                                   ? 'Record mic or upload an audio file below'
-                                  : '$_selectedAudioMime · ${_audioSizeKb ?? 0} KB ready',
+                                  : '$_selectedAudioMime Â· ${_audioSizeKb ?? 0} KB ready',
                               style: const TextStyle(
                                   fontSize: 12, color: Color(0xFF64748B)),
                             ),
@@ -1797,7 +1792,7 @@ class _HomeScreenState extends State<HomeScreen> {
           style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
         ),
         subtitle: Text(
-          '${scan.classification} · ${scan.confidence}% · ${scan.mediaType.toUpperCase()} · ${scan.sourceChannel}',
+          '${scan.classification} Â· ${scan.confidence}% Â· ${scan.mediaType.toUpperCase()} Â· ${scan.sourceChannel}',
           style: TextStyle(
             fontSize: 12,
             color: _verdictColor(scan.classification),
@@ -2112,7 +2107,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'CUMO Note: ${result.cumoNote} · Source: ${result.sourceChannel}',
+                  'CUMO Note: ${result.cumoNote} Â· Source: ${result.sourceChannel}',
                   style: const TextStyle(
                       fontSize: 11, color: Color(0xFF64748B), height: 1.4),
                 ),

@@ -16,7 +16,7 @@ class PickedAudioData {
   });
 }
 
-Future<PickedAudioData?> pickAudioFromWeb() async {
+Future<PickedAudioData?> pickAudioFromPlatform() async {
   final input = html.FileUploadInputElement()
     ..accept = 'audio/*,.mp3,.wav,.m4a,.ogg,.webm';
   final completer = Completer<PickedAudioData?>();
@@ -66,7 +66,7 @@ Future<PickedAudioData?> pickAudioFromWeb() async {
   return completer.future;
 }
 
-Future<PickedAudioData?> recordVoiceFromWeb(BuildContext context) async {
+Future<PickedAudioData?> recordVoiceFromPlatform(BuildContext context) async {
   final mediaDevices = html.window.navigator.mediaDevices;
   if (mediaDevices == null) {
     throw Exception('Browser microphone API unavailable. Use localhost or HTTPS.');

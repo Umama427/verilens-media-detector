@@ -13,10 +13,10 @@ class PickedAudioData {
   });
 }
 
-Future<PickedAudioData?> pickAudioFromWeb() async {
+Future<PickedAudioData?> pickAudioFromPlatform() async {
   return null;
 }
 
-Future<PickedAudioData?> recordVoiceFromWeb(BuildContext context) async {
+Future<PickedAudioData?> recordVoiceFromPlatform(BuildContext context) async {
   return null;
 }

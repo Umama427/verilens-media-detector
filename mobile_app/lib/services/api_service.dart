@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
+import 'session_store.dart';
 
 class AuthUser {
   final String id;
@@ -88,6 +89,22 @@ class MediaAnalysisResponse {
 class ApiService {
   static const String baseUrl = 'https://verilens-api-delta.vercel.app';
 
+  static Map<String, dynamic> _safeJsonMap(http.Response response) {
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {}
+    return <String, dynamic>{
+      'error':
+          'Server returned HTTP ${response.statusCode}. Please check your connection and try again.',
+    };
+  }
+
   static Future<Map<String, dynamic>> checkHealth() async {
     final response = await http
         .get(Uri.parse('$baseUrl/api/health'))
@@ -95,7 +112,7 @@ class ApiService {
     if (response.statusCode != 200) {
       throw Exception('Backend offline (${response.statusCode})');
     }
-    return jsonDecode(response.body) as Map<String, dynamic>;
+    return _safeJsonMap(response);
   }
 
   static Future<String> sendRegisterOtp({
@@ -106,11 +123,14 @@ class ApiService {
         .post(
           Uri.parse('$baseUrl/api/auth/send-register-otp'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'name': name, 'email': email}),
+          body: jsonEncode({
+            'name': name,
+            'email': email,
+          }),
         )
         .timeout(const Duration(seconds: 20));
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(decoded['error'] ?? 'Could not send OTP to your email.');
     }
@@ -125,13 +145,14 @@ class ApiService {
     required String otpToken,
     String role = 'Media Analyst',
   }) async {
+    final cleanEmail = email.trim().toLowerCase();
     final response = await http
         .post(
           Uri.parse('$baseUrl/api/auth/register'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'name': name,
-            'email': email,
+            'email': cleanEmail,
             'password': password,
             'otp': otp,
             'otpToken': otpToken,
@@ -140,9 +161,13 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 20));
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(decoded['error'] ?? 'Registration failed.');
+    }
+    final proof = (decoded['accountProof'] ?? '').toString();
+    if (proof.isNotEmpty) {
+      saveStorageItem('verilens_proof_$cleanEmail', proof);
     }
     return AuthUser.fromJson({
       ...Map<String, dynamic>.from(decoded['user'] ?? {}),
@@ -154,17 +179,27 @@ class ApiService {
     required String email,
     required String password,
   }) async {
+    final cleanEmail = email.trim().toLowerCase();
+    final savedProof = readStorageItem('verilens_proof_$cleanEmail') ?? '';
     final response = await http
         .post(
           Uri.parse('$baseUrl/api/auth/login'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'email': email, 'password': password}),
+          body: jsonEncode({
+            'email': cleanEmail,
+            'password': password,
+            if (savedProof.isNotEmpty) 'accountProof': savedProof,
+          }),
         )
         .timeout(const Duration(seconds: 15));
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(decoded['error'] ?? 'Invalid email or password.');
+    }
+    final proof = (decoded['accountProof'] ?? '').toString();
+    if (proof.isNotEmpty) {
+      saveStorageItem('verilens_proof_$cleanEmail', proof);
     }
     return AuthUser.fromJson({
       ...Map<String, dynamic>.from(decoded['user'] ?? {}),
@@ -172,16 +207,18 @@ class ApiService {
     });
   }
 
-  static Future<String> forgotPassword({required String email}) async {
+  static Future<String> forgotPassword({
+    required String email,
+  }) async {
     final response = await http
         .post(
           Uri.parse('$baseUrl/api/auth/forgot-password'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'email': email}),
+          body: jsonEncode({'email': email.trim().toLowerCase()}),
         )
         .timeout(const Duration(seconds: 20));
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(decoded['error'] ?? 'Could not send reset OTP email.');
     }
@@ -194,12 +231,13 @@ class ApiService {
     required String newPassword,
     required String resetToken,
   }) async {
+    final cleanEmail = email.trim().toLowerCase();
     final response = await http
         .post(
           Uri.parse('$baseUrl/api/auth/reset-password'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
-            'email': email,
+            'email': cleanEmail,
             'code': code,
             'newPassword': newPassword,
             'resetToken': resetToken,
@@ -207,9 +245,13 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 15));
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(decoded['error'] ?? 'Password reset failed.');
+    }
+    final proof = (decoded['accountProof'] ?? '').toString();
+    if (proof.isNotEmpty) {
+      saveStorageItem('verilens_proof_$cleanEmail', proof);
     }
   }
 
@@ -243,11 +285,12 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 30));
 
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Analysis failed (${response.statusCode}): ${response.body}');
+      throw Exception(
+          decoded['error'] ?? 'Analysis failed (${response.statusCode})');
     }
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
     return MediaAnalysisResponse.fromJson(decoded);
   }
 
@@ -281,11 +324,12 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 30));
 
+    final decoded = _safeJsonMap(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Voice analysis failed (${response.statusCode}): ${response.body}');
+      throw Exception(
+          decoded['error'] ?? 'Voice analysis failed (${response.statusCode})');
     }
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
     return MediaAnalysisResponse.fromJson(decoded);
   }
 
@@ -296,7 +340,7 @@ class ApiService {
     if (response.statusCode != 200) {
       throw Exception('Failed to load scans (${response.statusCode})');
     }
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _safeJsonMap(response);
     final items = List<Map<String, dynamic>>.from(decoded['scans'] ?? []);
     return items.map(MediaAnalysisResponse.fromJson).toList();
   }
@@ -306,7 +350,7 @@ class ApiService {
         .post(Uri.parse('$baseUrl/api/apk/track'))
         .timeout(const Duration(seconds: 10));
     if (response.statusCode == 200) {
-      final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+      final decoded = _safeJsonMap(response);
       return (decoded['totalShares'] as num?)?.toInt() ?? 1;
     }
     return 1;
