@@ -101,9 +101,17 @@ Future<PickedAudioData?> recordVoiceFromWeb(BuildContext context) async {
     builder: (ctx) => _MicRecordingDialog(),
   );
 
-  final stopFuture = recorder.onStop.first;
+  final stopCompleter = Completer<void>();
+  recorder.addEventListener('stop', (html.Event _) {
+    if (!stopCompleter.isCompleted) {
+      stopCompleter.complete();
+    }
+  });
   recorder.stop();
-  await stopFuture;
+  await stopCompleter.future.timeout(
+    const Duration(seconds: 3),
+    onTimeout: () {},
+  );
 
   for (final track in stream.getTracks()) {
     track.stop();
@@ -197,7 +205,7 @@ class _MicRecordingDialogState extends State<_MicRecordingDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.of(ctx).pop(false),
+          onPressed: () => Navigator.of(context).pop(false),
           child: const Text('Cancel'),
         ),
         FilledButton.icon(

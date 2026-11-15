@@ -1117,7 +1117,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                 borderRadius: BorderRadius.circular(12)),
                           ),
                           icon: const Icon(Icons.camera_alt_outlined, size: 18),
-                          label: Text(kIsWeb ? 'Live Webcam' : 'Camera'),
+                          label: const Text(kIsWeb ? 'Live Webcam' : 'Camera'),
                         ),
                       ),
                       const SizedBox(width: 10),
@@ -1482,9 +1482,9 @@ class _HomeScreenState extends State<HomeScreen> {
         side: const BorderSide(color: Color(0xFFE2E8F0)),
       ),
       child: ListTile(
-        leading: CircleAvatar(
-          backgroundColor: const Color(0xFFCCFBF1),
-          child: const Icon(Icons.graphic_eq, color: Color(0xFF0F766E)),
+        leading: const CircleAvatar(
+          backgroundColor: Color(0xFFCCFBF1),
+          child: Icon(Icons.graphic_eq, color: Color(0xFF0F766E)),
         ),
         title: Text(title,
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
