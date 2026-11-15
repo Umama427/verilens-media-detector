@@ -37,14 +37,14 @@ class AuthUser {
 }
 
 class MediaAnalysisResponse {
-  final String classification; // Real | Fake | Suspicious
+  final String classification;
   final int confidence;
   final String summary;
   final List<String> visualSignals;
   final String textConsistency;
   final String cumoNote;
   final String sourceChannel;
-  final String mediaType; // image | voice
+  final String mediaType;
   final String fileName;
   final String description;
   final String analyzedAt;
@@ -98,10 +98,31 @@ class ApiService {
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
+  static Future<String> sendRegisterOtp({
+    required String name,
+    required String email,
+  }) async {
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/api/auth/send-register-otp'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'name': name, 'email': email}),
+        )
+        .timeout(const Duration(seconds: 20));
+
+    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(decoded['error'] ?? 'Could not send OTP to your email.');
+    }
+    return (decoded['otpToken'] ?? '').toString();
+  }
+
   static Future<AuthUser> register({
     required String name,
     required String email,
     required String password,
+    required String otp,
+    required String otpToken,
     String role = 'Media Analyst',
   }) async {
     final response = await http
@@ -112,10 +133,12 @@ class ApiService {
             'name': name,
             'email': email,
             'password': password,
+            'otp': otp,
+            'otpToken': otpToken,
             'role': role,
           }),
         )
-        .timeout(const Duration(seconds: 15));
+        .timeout(const Duration(seconds: 20));
 
     final decoded = jsonDecode(response.body) as Map<String, dynamic>;
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -135,10 +158,7 @@ class ApiService {
         .post(
           Uri.parse('$baseUrl/api/auth/login'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'email': email,
-            'password': password,
-          }),
+          body: jsonEncode({'email': email, 'password': password}),
         )
         .timeout(const Duration(seconds: 15));
 
@@ -152,22 +172,20 @@ class ApiService {
     });
   }
 
-  static Future<Map<String, dynamic>> forgotPassword({
-    required String email,
-  }) async {
+  static Future<String> forgotPassword({required String email}) async {
     final response = await http
         .post(
           Uri.parse('$baseUrl/api/auth/forgot-password'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'email': email}),
         )
-        .timeout(const Duration(seconds: 15));
+        .timeout(const Duration(seconds: 20));
 
     final decoded = jsonDecode(response.body) as Map<String, dynamic>;
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(decoded['error'] ?? 'Could not generate reset code.');
+      throw Exception(decoded['error'] ?? 'Could not send reset OTP email.');
     }
-    return decoded;
+    return (decoded['resetToken'] ?? '').toString();
   }
 
   static Future<void> resetPassword({
@@ -226,8 +244,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-          'Analysis failed (${response.statusCode}): ${response.body}');
+      throw Exception('Analysis failed (${response.statusCode}): ${response.body}');
     }
 
     final decoded = jsonDecode(response.body) as Map<String, dynamic>;
@@ -265,8 +282,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-          'Voice analysis failed (${response.statusCode}): ${response.body}');
+      throw Exception('Voice analysis failed (${response.statusCode}): ${response.body}');
     }
 
     final decoded = jsonDecode(response.body) as Map<String, dynamic>;

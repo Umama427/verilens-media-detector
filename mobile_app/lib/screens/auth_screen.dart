@@ -1,7 +1,6 @@
-import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
-import '../services/session_store.dart';
 
 enum AuthMode { login, register, forgot }
 
@@ -18,6 +17,7 @@ class _AuthScreenState extends State<AuthScreen> {
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _registerOtpController = TextEditingController();
   final TextEditingController _resetCodeController = TextEditingController();
   final TextEditingController _newPasswordController = TextEditingController();
 
@@ -25,53 +25,48 @@ class _AuthScreenState extends State<AuthScreen> {
   String _selectedRole = 'Media Analyst';
   bool _obscurePassword = true;
   bool _loading = false;
+  bool _registerOtpSent = false;
   bool _resetCodeSent = false;
+  String? _registerOtpToken;
   String? _serverResetToken;
-  String? _demoResetCode;
+  int _resendSeconds = 0;
+  Timer? _resendTimer;
   String? _error;
   String? _successMessage;
 
   @override
   void dispose() {
+    _resendTimer?.cancel();
     _nameController.dispose();
     _emailController.dispose();
     _passwordController.dispose();
+    _registerOtpController.dispose();
     _resetCodeController.dispose();
     _newPasswordController.dispose();
     super.dispose();
   }
 
-  Map<String, Map<String, dynamic>> _loadLocalUsers() {
-    try {
-      final raw = readStorageItem('verilens_local_users');
-      if (raw != null && raw.isNotEmpty) {
-        final parsed = jsonDecode(raw) as Map<String, dynamic>;
-        return parsed.map(
-          (k, v) => MapEntry(k, Map<String, dynamic>.from(v as Map)),
-        );
+  void _startResendCooldown() {
+    _resendTimer?.cancel();
+    setState(() => _resendSeconds = 60);
+    _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
       }
-    } catch (_) {}
-    return {
-      'umamakhan427@gmail.com': {
-        'id': 'usr_umama',
-        'name': 'Umama Khan',
-        'email': 'umamakhan427@gmail.com',
-        'role': 'Lead Forensic Analyst',
-        'password': 'Umama@123',
-      },
-    };
-  }
-
-  void _saveLocalUser(String email, Map<String, dynamic> userRecord) {
-    final users = _loadLocalUsers();
-    users[email.toLowerCase()] = userRecord;
-    saveStorageItem('verilens_local_users', jsonEncode(users));
+      if (_resendSeconds <= 1) {
+        timer.cancel();
+        setState(() => _resendSeconds = 0);
+      } else {
+        setState(() => _resendSeconds -= 1);
+      }
+    });
   }
 
   Future<void> _handleLogin() async {
     final email = _emailController.text.trim().toLowerCase();
     final password = _passwordController.text;
-    if (email.isEmpty || !email.contains('@') || password.length < 4) {
+    if (email.isEmpty || !email.contains('@') || password.length < 6) {
       setState(() => _error = 'Please enter a valid email and password.');
       return;
     }
@@ -84,32 +79,16 @@ class _AuthScreenState extends State<AuthScreen> {
 
     try {
       final user = await ApiService.login(email: email, password: password);
-      _saveLocalUser(email, {...user.toJson(), 'password': password});
       widget.onAuthenticated(user);
-    } catch (apiErr) {
-      final localUsers = _loadLocalUsers();
-      final match = localUsers[email];
-      if (match != null && match['password'] == password) {
-        widget.onAuthenticated(
-          AuthUser(
-            id: (match['id'] ?? 'local_1').toString(),
-            name: (match['name'] ?? 'Analyst').toString(),
-            email: email,
-            role: (match['role'] ?? 'Media Analyst').toString(),
-            token: 'local_session_token',
-          ),
-        );
-        return;
-      }
+    } catch (err) {
       if (!mounted) return;
-      setState(() =>
-          _error = apiErr.toString().replaceFirst('Exception: ', ''));
+      setState(() => _error = err.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _handleRegister() async {
+  Future<void> _handleSendRegisterOtp() async {
     final name = _nameController.text.trim();
     final email = _emailController.text.trim().toLowerCase();
     final password = _passwordController.text;
@@ -134,29 +113,53 @@ class _AuthScreenState extends State<AuthScreen> {
     });
 
     try {
+      final token = await ApiService.sendRegisterOtp(name: name, email: email);
+      if (!mounted) return;
+      _startResendCooldown();
+      setState(() {
+        _registerOtpSent = true;
+        _registerOtpToken = token;
+        _successMessage =
+            'Real-time 6-digit OTP sent to $email. Please check your inbox (or Spam).';
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => _error = err.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _handleRegister() async {
+    final name = _nameController.text.trim();
+    final email = _emailController.text.trim().toLowerCase();
+    final password = _passwordController.text;
+    final otp = _registerOtpController.text.trim();
+
+    if (otp.length != 6) {
+      setState(() => _error = 'Enter the 6-digit OTP sent to your email.');
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = null;
+      _successMessage = null;
+    });
+
+    try {
       final user = await ApiService.register(
         name: name,
         email: email,
         password: password,
+        otp: otp,
+        otpToken: _registerOtpToken ?? '',
         role: _selectedRole,
       );
-      _saveLocalUser(email, {...user.toJson(), 'password': password});
       widget.onAuthenticated(user);
     } catch (err) {
-      final localUser = AuthUser(
-        id: 'usr_${DateTime.now().millisecondsSinceEpoch}',
-        name: name,
-        email: email,
-        role: _selectedRole,
-        token: 'local_session_token',
-      );
-      _saveLocalUser(email, {...localUser.toJson(), 'password': password});
       if (!mounted) return;
-      if (err.toString().toLowerCase().contains('exists')) {
-        setState(() => _error = 'An account with this email already exists.');
-      } else {
-        widget.onAuthenticated(localUser);
-      }
+      setState(() => _error = err.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -176,24 +179,18 @@ class _AuthScreenState extends State<AuthScreen> {
     });
 
     try {
-      final res = await ApiService.forgotPassword(email: email);
+      final resetToken = await ApiService.forgotPassword(email: email);
       if (!mounted) return;
+      _startResendCooldown();
       setState(() {
         _resetCodeSent = true;
-        _serverResetToken = (res['resetToken'] ?? '').toString();
-        _demoResetCode = (res['demoCode'] ?? '482910').toString();
+        _serverResetToken = resetToken;
         _successMessage =
-            'Verification code generated! Enter code $_demoResetCode below to set a new password.';
+            'Real-time 6-digit OTP sent to $email. Check your inbox and enter it below.';
       });
-    } catch (_) {
+    } catch (err) {
       if (!mounted) return;
-      setState(() {
-        _resetCodeSent = true;
-        _serverResetToken = 'local_reset';
-        _demoResetCode = '482910';
-        _successMessage =
-            'Verification code ready: 482910. Enter it below to reset your password.';
-      });
+      setState(() => _error = err.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -204,9 +201,9 @@ class _AuthScreenState extends State<AuthScreen> {
     final code = _resetCodeController.text.trim();
     final newPass = _newPasswordController.text;
 
-    if (code.length < 4 || newPass.length < 6) {
-      setState(() =>
-          _error = 'Enter the 6-digit code and a new password (min 6 chars).');
+    if (code.length != 6 || newPass.length < 6) {
+      setState(() => _error =
+          'Enter the 6-digit email OTP and a new password (min 6 chars).');
       return;
     }
 
@@ -216,48 +213,28 @@ class _AuthScreenState extends State<AuthScreen> {
     });
 
     try {
-      if (_serverResetToken != null && _serverResetToken != 'local_reset') {
-        await ApiService.resetPassword(
-          email: email,
-          code: code,
-          newPassword: newPass,
-          resetToken: _serverResetToken!,
-        );
-      } else if (code != _demoResetCode) {
-        throw Exception('Invalid verification code.');
-      }
-
-      final users = _loadLocalUsers();
-      final existing = users[email] ??
-          {
-            'id': 'usr_${DateTime.now().millisecondsSinceEpoch}',
-            'name': email.split('@').first,
-            'email': email,
-            'role': 'Media Analyst',
-          };
-      existing['password'] = newPass;
-      _saveLocalUser(email, existing);
+      await ApiService.resetPassword(
+        email: email,
+        code: code,
+        newPassword: newPass,
+        resetToken: _serverResetToken ?? '',
+      );
 
       if (!mounted) return;
       setState(() {
         _mode = AuthMode.login;
         _resetCodeSent = false;
+        _resetCodeController.clear();
+        _newPasswordController.clear();
         _passwordController.text = newPass;
         _successMessage = 'Password updated! Sign in with your new password.';
       });
     } catch (err) {
       if (!mounted) return;
-      setState(() =>
-          _error = err.toString().replaceFirst('Exception: ', ''));
+      setState(() => _error = err.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
-  }
-
-  void _quickDemoLogin() {
-    _emailController.text = 'umamakhan427@gmail.com';
-    _passwordController.text = 'Umama@123';
-    _handleLogin();
   }
 
   @override
@@ -376,8 +353,8 @@ class _AuthScreenState extends State<AuthScreen> {
                     text: 'AI Voice Clone & Human Speech Verification'),
                 SizedBox(height: 10),
                 _FeatureLine(
-                    icon: Icons.cloud_done_outlined,
-                    text: 'Vercel Cloud API + CUMO Alignment'),
+                    icon: Icons.mark_email_read_outlined,
+                    text: 'Real-Time Email OTP Security & Cloud Sync'),
               ],
             ),
           ],
@@ -440,8 +417,7 @@ class _AuthScreenState extends State<AuthScreen> {
             TextField(
               controller: _passwordController,
               obscureText: _obscurePassword,
-              decoration:
-                  _inputDeco('Password', Icons.lock_outline).copyWith(
+              decoration: _inputDeco('Password', Icons.lock_outline).copyWith(
                 suffixIcon: IconButton(
                   icon: Icon(_obscurePassword
                       ? Icons.visibility_outlined
@@ -452,13 +428,21 @@ class _AuthScreenState extends State<AuthScreen> {
               ),
             ),
           ],
+          if (_mode == AuthMode.register && _registerOtpSent) ...[
+            const SizedBox(height: 12),
+            TextField(
+              controller: _registerOtpController,
+              keyboardType: TextInputType.number,
+              decoration:
+                  _inputDeco('6-Digit Email OTP', Icons.mark_email_read_outlined),
+            ),
+          ],
           if (_mode == AuthMode.forgot && _resetCodeSent) ...[
             const SizedBox(height: 12),
             TextField(
               controller: _resetCodeController,
               keyboardType: TextInputType.number,
-              decoration:
-                  _inputDeco('6-Digit Verification Code', Icons.pin_outlined),
+              decoration: _inputDeco('6-Digit Email OTP', Icons.pin_outlined),
             ),
             const SizedBox(height: 12),
             TextField(
@@ -512,7 +496,11 @@ class _AuthScreenState extends State<AuthScreen> {
                     if (_mode == AuthMode.login) {
                       _handleLogin();
                     } else if (_mode == AuthMode.register) {
-                      _handleRegister();
+                      if (_registerOtpSent) {
+                        _handleRegister();
+                      } else {
+                        _handleSendRegisterOtp();
+                      }
                     } else if (!_resetCodeSent) {
                       _handleForgotRequest();
                     } else {
@@ -530,24 +518,35 @@ class _AuthScreenState extends State<AuthScreen> {
                     _mode == AuthMode.login
                         ? 'Sign In to VeriLens'
                         : _mode == AuthMode.register
-                            ? 'Create Free Account'
+                            ? (_registerOtpSent
+                                ? 'Verify OTP & Create Account'
+                                : 'Send Real-Time Email OTP')
                             : (_resetCodeSent
-                                ? 'Confirm New Password'
-                                : 'Send Verification Code'),
+                                ? 'Verify OTP & Update Password'
+                                : 'Send Real-Time Reset OTP'),
                     style: const TextStyle(fontWeight: FontWeight.w600),
                   ),
           ),
-          const SizedBox(height: 12),
-          OutlinedButton.icon(
-            onPressed: _loading ? null : _quickDemoLogin,
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 13),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+          if ((_mode == AuthMode.register && _registerOtpSent) ||
+              (_mode == AuthMode.forgot && _resetCodeSent)) ...[
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: _loading || _resendSeconds > 0
+                  ? null
+                  : () {
+                      if (_mode == AuthMode.register) {
+                        _handleSendRegisterOtp();
+                      } else {
+                        _handleForgotRequest();
+                      }
+                    },
+              child: Text(
+                _resendSeconds > 0
+                    ? 'Resend OTP in ${_resendSeconds}s'
+                    : 'Resend 6-Digit Email OTP',
+              ),
             ),
-            icon: const Icon(Icons.flash_on_outlined, size: 18),
-            label: const Text('Quick Demo Login (umamakhan427@gmail.com)'),
-          ),
+          ],
         ],
       ),
     );

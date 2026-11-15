@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
+import nodemailer from 'nodemailer';
 import { MongoClient } from 'mongodb';
 
 dotenv.config();
@@ -17,19 +18,85 @@ const authSecret = process.env.AUTH_SECRET || 'verilens-stateless-forensic-key';
 
 let cachedClient = null;
 const memoryScans = [];
-const memoryUsers = new Map([
-  [
-    'umamakhan427@gmail.com',
-    {
-      id: 'usr_umama',
-      name: 'Umama Khan',
-      email: 'umamakhan427@gmail.com',
-      role: 'Lead Forensic Analyst',
-      passwordHash: hashPassword('Umama@123'),
-    },
-  ],
-]);
+const memoryUsers = new Map();
+const usedOtpNonces = new Set();
 let memoryApkShares = 12;
+
+function isEmailOtpConfigured() {
+  return Boolean(
+    (process.env.SMTP_USER && process.env.SMTP_PASS) ||
+      process.env.RESEND_API_KEY
+  );
+}
+
+async function sendRealOtpEmail({ to, code, purpose, recipientName = '' }) {
+  const subject =
+    purpose === 'register'
+      ? `VeriLens AI — Verify Your Email (OTP: ${code})`
+      : `VeriLens AI — Password Reset OTP (${code})`;
+  const heading =
+    purpose === 'register'
+      ? 'Verify Your VeriLens AI Account'
+      : 'Reset Your VeriLens AI Password';
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e2e8f0;border-radius:14px;">
+      <h2 style="color:#0f172a;margin:0 0 12px;">${heading}</h2>
+      <p style="color:#475569;font-size:14px;line-height:1.5;">
+        Hello ${recipientName || 'Analyst'}, use the one-time verification code below. This code expires in <strong>10 minutes</strong>.
+      </p>
+      <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:16px;text-align:center;margin:20px 0;">
+        <span style="font-size:30px;font-weight:800;letter-spacing:6px;color:#1d4ed8;">${code}</span>
+      </div>
+      <p style="color:#64748b;font-size:12px;">If you did not request this code, you can safely ignore this email.</p>
+    </div>
+  `;
+
+  if (process.env.RESEND_API_KEY) {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: process.env.RESEND_FROM || 'VeriLens AI <onboarding@resend.dev>',
+        to: [to],
+        subject,
+        html,
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Resend email delivery failed: ${text}`);
+    }
+    return 'resend';
+  }
+
+  if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+    const port = Number(process.env.SMTP_PORT || 465);
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port,
+      secure: port === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || `VeriLens AI <${process.env.SMTP_USER}>`,
+      to,
+      subject,
+      text: `Your VeriLens AI verification OTP is ${code}. It expires in 10 minutes.`,
+      html,
+    });
+    return 'smtp';
+  }
+
+  throw new Error(
+    'Real-time Email OTP is not configured yet. Add SMTP_USER & SMTP_PASS (Gmail App Password) or RESEND_API_KEY in Vercel Environment Variables.'
+  );
+}
 
 function hashPassword(password) {
   return crypto.createHash('sha256').update(`verilens:${password}`).digest('hex');
@@ -215,8 +282,10 @@ app.get('/', (_req, res) => {
     ok: true,
     service: 'verilens-vercel-api',
     storage: mongoUri ? 'mongodb' : 'vercel-memory',
+    otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
     endpoints: [
       '/api/health',
+      '/api/auth/send-register-otp',
       '/api/auth/register',
       '/api/auth/login',
       '/api/auth/forgot-password',
@@ -234,22 +303,73 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     service: 'verilens-vercel-api',
     storage: mongoUri ? 'mongodb' : 'vercel-memory',
+    otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
   });
+});
+
+app.post('/api/auth/send-register-otp', async (req, res) => {
+  try {
+    const { name = '', email = '' } = req.body || {};
+    const cleanEmail = email.trim().toLowerCase();
+    if (!name.trim() || !cleanEmail.includes('@')) {
+      return res.status(400).json({ error: 'Name and valid email are required.' });
+    }
+    const db = await getDb();
+    if (db) {
+      const existing = await db.collection('users').findOne({ email: cleanEmail });
+      if (existing) return res.status(409).json({ error: 'Email is already registered.' });
+    } else if (memoryUsers.has(cleanEmail)) {
+      return res.status(409).json({ error: 'Email is already registered.' });
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const provider = await sendRealOtpEmail({
+      to: cleanEmail,
+      code,
+      purpose: 'register',
+      recipientName: name.trim(),
+    });
+    const otpToken = signPayload({
+      purpose: 'register',
+      email: cleanEmail,
+      codeHash: hashPassword(`${cleanEmail}:${code}`),
+      nonce,
+      exp: Date.now() + 10 * 60 * 1000,
+    });
+    res.json({ ok: true, delivery: provider, otpToken, message: '6-digit OTP sent to your email.' });
+  } catch (err) {
+    const status = err.message.includes('not configured') ? 503 : 500;
+    res.status(status).json({ error: err.message });
+  }
 });
 
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { name = '', email = '', password = '', role = 'Media Analyst' } = req.body || {};
+    const { name = '', email = '', password = '', otp = '', otpToken = '', role = 'Media Analyst' } = req.body || {};
     const cleanEmail = email.trim().toLowerCase();
     if (!name.trim() || !cleanEmail.includes('@') || password.length < 6) {
       return res.status(400).json({ error: 'Name, valid email, and password (min 6 chars) are required.' });
     }
+    const verified = verifyToken(otpToken);
+    if (
+      !verified ||
+      verified.purpose !== 'register' ||
+      verified.email !== cleanEmail ||
+      verified.codeHash !== hashPassword(`${cleanEmail}:${otp.trim()}`) ||
+      usedOtpNonces.has(verified.nonce)
+    ) {
+      return res.status(400).json({ error: 'Invalid or expired email OTP.' });
+    }
+    usedOtpNonces.add(verified.nonce);
+
     const userDoc = {
       id: `usr_${Date.now()}`,
       name: name.trim(),
       email: cleanEmail,
       role,
       passwordHash: hashPassword(password),
+      verifiedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
     };
     const db = await getDb();
@@ -289,18 +409,35 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/forgot-password', async (req, res) => {
-  const cleanEmail = (req.body?.email || '').trim().toLowerCase();
-  if (!cleanEmail.includes('@')) {
-    return res.status(400).json({ error: 'Valid email is required.' });
+  try {
+    const cleanEmail = (req.body?.email || '').trim().toLowerCase();
+    if (!cleanEmail.includes('@')) {
+      return res.status(400).json({ error: 'Valid email is required.' });
+    }
+    const code = String(crypto.randomInt(100000, 1000000));
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const provider = await sendRealOtpEmail({
+      to: cleanEmail,
+      code,
+      purpose: 'reset',
+    });
+    const resetToken = signPayload({
+      purpose: 'reset',
+      email: cleanEmail,
+      codeHash: hashPassword(`${cleanEmail}:${code}`),
+      nonce,
+      exp: Date.now() + 10 * 60 * 1000,
+    });
+    res.json({
+      ok: true,
+      delivery: provider,
+      message: '6-digit verification OTP sent to your email.',
+      resetToken,
+    });
+  } catch (err) {
+    const status = err.message.includes('not configured') ? 503 : 500;
+    res.status(status).json({ error: err.message });
   }
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  const resetToken = signPayload({ email: cleanEmail, code, exp: Date.now() + 15 * 60 * 1000 });
-  res.json({
-    ok: true,
-    message: '6-digit verification code generated.',
-    demoCode: code,
-    resetToken,
-  });
 });
 
 app.post('/api/auth/reset-password', async (req, res) => {
@@ -308,12 +445,19 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const { email = '', code = '', newPassword = '', resetToken = '' } = req.body || {};
     const cleanEmail = email.trim().toLowerCase();
     const verified = verifyToken(resetToken);
-    if (!verified || verified.email !== cleanEmail || verified.code !== code.trim()) {
-      return res.status(400).json({ error: 'Invalid or expired reset code.' });
+    if (
+      !verified ||
+      verified.purpose !== 'reset' ||
+      verified.email !== cleanEmail ||
+      verified.codeHash !== hashPassword(`${cleanEmail}:${code.trim()}`) ||
+      usedOtpNonces.has(verified.nonce)
+    ) {
+      return res.status(400).json({ error: 'Invalid or expired reset OTP.' });
     }
     if (newPassword.length < 6) {
       return res.status(400).json({ error: 'New password must be at least 6 characters.' });
     }
+    usedOtpNonces.add(verified.nonce);
     const newHash = hashPassword(newPassword);
     const db = await getDb();
     if (db) {
@@ -389,6 +533,10 @@ app.post('/api/analyze-voice', async (req, res) => {
       sourceChannel = 'Voice Forensics',
       sampleTag = '',
     } = req.body || {};
+
+    if (!audioBase64 && !transcriptOrClaim.trim() && !sampleTag) {
+      return res.status(400).json({ error: 'Audio file, recording, or voice claim is required.' });
+    }
 
     const result = inspectVoiceForensics({
       audioBase64,
