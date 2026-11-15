@@ -1,0 +1,7 @@
+.env
+node_modules/
+.vercel/
+mobile_app/build/
+mobile_app/.dart_tool/
+mobile_app/.idea/
+*.iml
