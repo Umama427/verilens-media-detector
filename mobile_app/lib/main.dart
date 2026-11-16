@@ -258,7 +258,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
 
-    final picked = await _picker.pickImage(source: source, imageQuality: 85);
+    final picked = await _picker.pickImage(source: source, maxWidth: 1920, maxHeight: 1920, imageQuality: 90);
     if (picked != null) {
       final bytes = await picked.readAsBytes();
       final lowerName = picked.name.toLowerCase();
@@ -1045,7 +1045,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ),
                                     SizedBox(height: 4),
                                     Text(
-                                      'Supports JPEG, PNG, WebP Â· EXIF & AI pixel checks',
+                                      'Supports JPEG, PNG, WebP \u00B7 EXIF & AI pixel checks',
                                       style: TextStyle(
                                           fontSize: 12,
                                           color: Color(0xFF64748B)),
@@ -1087,7 +1087,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               borderRadius: BorderRadius.circular(20),
                             ),
                             child: Text(
-                              '${_imageResult!.classification.toUpperCase()} Â· ${_imageResult!.confidence}%',
+                              '${_imageResult!.classification.toUpperCase()} \u00B7 ${_imageResult!.confidence}%',
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.w800,
@@ -1107,7 +1107,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         child: OutlinedButton.icon(
                           onPressed: () => _pickImage(ImageSource.camera),
                           style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 13),
+                            padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 8),
                             shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12)),
                           ),
@@ -1120,13 +1120,13 @@ class _HomeScreenState extends State<HomeScreen> {
                         child: OutlinedButton.icon(
                           onPressed: () => _pickImage(ImageSource.gallery),
                           style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 13),
+                            padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 8),
                             shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12)),
                           ),
                           icon: const Icon(Icons.photo_library_outlined,
                               size: 18),
-                          label: const Text('Upload Image'),
+                          label: const Text('Gallery', maxLines: 1, softWrap: false),
                         ),
                       ),
                       if (_selectedImageBytes != null) ...[
@@ -1156,7 +1156,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'Attached: $_selectedImageName Â· $_imageSizeKb KB Â· Ready to Analyze',
+                            'Attached: $_selectedImageName \u00B7 $_imageSizeKb KB \u00B7 Ready to Analyze',
                             style: const TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w500,
@@ -1332,7 +1332,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             Text(
                               _selectedAudioBytes == null
                                   ? 'Record mic or upload an audio file below'
-                                  : '$_selectedAudioMime Â· ${_audioSizeKb ?? 0} KB ready',
+                                  : '$_selectedAudioMime \u00B7 ${_audioSizeKb ?? 0} KB ready',
                               style: const TextStyle(
                                   fontSize: 12, color: Color(0xFF64748B)),
                             ),
@@ -1359,7 +1359,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: OutlinedButton.icon(
                         onPressed: _recordVoice,
                         style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 8),
                           shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12)),
                         ),
@@ -1372,7 +1372,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: OutlinedButton.icon(
                         onPressed: _pickAudioFile,
                         style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 8),
                           shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12)),
                         ),
@@ -1792,7 +1792,7 @@ class _HomeScreenState extends State<HomeScreen> {
           style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
         ),
         subtitle: Text(
-          '${scan.classification} Â· ${scan.confidence}% Â· ${scan.mediaType.toUpperCase()} Â· ${scan.sourceChannel}',
+          '${scan.classification} \u00B7 ${scan.confidence}% \u00B7 ${scan.mediaType.toUpperCase()} \u00B7 ${scan.sourceChannel}',
           style: TextStyle(
             fontSize: 12,
             color: _verdictColor(scan.classification),
@@ -1875,7 +1875,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 6),
               const Text(
-                'VeriLens AI v1.0.1+2 · Play Store & Cloud Ready. Share app or verify backend status.',
+                'VeriLens AI v1.0.1+2 \u00B7 Play Store & Cloud Ready. Share app or verify backend status.',
                 style: TextStyle(fontSize: 13, color: Color(0xFF475569)),
               ),
               const SizedBox(height: 14),
@@ -2185,7 +2185,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'CUMO Note: ${result.cumoNote} Â· Source: ${result.sourceChannel}',
+                  'CUMO Note: ${result.cumoNote} \u00B7 Source: ${result.sourceChannel}',
                   style: const TextStyle(
                       fontSize: 11, color: Color(0xFF64748B), height: 1.4),
                 ),

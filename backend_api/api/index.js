@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 import nodemailer from 'nodemailer';
 import { put, get, del, BlobNotFoundError } from '@vercel/blob';
+import { GoogleGenAI, Type } from '@google/genai';
 
 dotenv.config();
 for (const k of [
@@ -43,7 +44,10 @@ const kvToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_
 const hasKv = Boolean(kvUrl && kvToken);
 const hasBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 const geminiKey = process.env.GEMINI_API_KEY || '';
+const aiClient = geminiKey ? new GoogleGenAI({ apiKey: geminiKey }) : null;
 const authSecret = process.env.AUTH_SECRET || 'verilens-stateless-forensic-key';
+
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
 
 let blobAccess = 'private';
 const memoryScans = [];
@@ -440,25 +444,25 @@ function extractAudioBinaryTelemetry(bytes, mimeType) {
 }
 
 const FORENSIC_RESPONSE_SCHEMA = {
-  type: 'OBJECT',
+  type: Type.OBJECT,
   properties: {
-    classification: { type: 'STRING', enum: ['Real', 'Fake', 'Suspicious'] },
-    confidence: { type: 'INTEGER' },
-    summary: { type: 'STRING' },
-    visualSignals: { type: 'ARRAY', items: { type: 'STRING' } },
-    textConsistency: { type: 'STRING' },
-    cumoNote: { type: 'STRING' },
+    classification: { type: Type.STRING },
+    confidence: { type: Type.INTEGER },
+    summary: { type: Type.STRING },
+    visualSignals: { type: Type.ARRAY, items: { type: Type.STRING } },
+    textConsistency: { type: Type.STRING },
+    cumoNote: { type: Type.STRING },
   },
   required: ['classification', 'confidence', 'summary', 'visualSignals', 'textConsistency', 'cumoNote'],
 };
 
 function normalizeVerdict(raw, engineLabel) {
-  const validClasses = ['Real', 'Fake', 'Suspicious'];
-  const classification = validClasses.includes(raw?.classification) ? raw.classification : 'Suspicious';
-  const confidence = Math.max(52, Math.min(99, Math.round(Number(raw?.confidence) || 75)));
+  const rawClass = String(raw?.classification || '').trim().toLowerCase();
+  const classification = rawClass === 'real' ? 'Real' : rawClass === 'fake' ? 'Fake' : 'Suspicious';
+  const confidence = Math.max(55, Math.min(99, Math.round(Number(raw?.confidence) || 78)));
   const visualSignals = Array.isArray(raw?.visualSignals) && raw.visualSignals.length > 0
     ? raw.visualSignals.map((s) => String(s)).slice(0, 5)
-    : ['Forensic signal analysis completed.'];
+    : ['Multimodal forensic inspection completed.'];
   return {
     classification,
     confidence,
@@ -469,29 +473,29 @@ function normalizeVerdict(raw, engineLabel) {
   };
 }
 
-async function analyzeWithGemini({ parts }) {
-  if (!geminiKey) return null;
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`;
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: 'application/json',
-        responseSchema: FORENSIC_RESPONSE_SCHEMA,
-      },
-    }),
-  });
-  if (!resp.ok) {
-    const errBody = await resp.text();
-    throw new Error(`Gemini API ${resp.status}: ${errBody.slice(0, 180)}`);
+async function analyzeWithGemini(parts) {
+  if (!aiClient) throw new Error('GEMINI_API_KEY missing');
+  let lastErr = null;
+  for (const model of GEMINI_MODELS) {
+    try {
+      const response = await aiClient.models.generateContent({
+        model,
+        contents: { parts },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: FORENSIC_RESPONSE_SCHEMA,
+        },
+      });
+      const text = (response.text || '').trim();
+      if (!text) throw new Error('Empty response text');
+      const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+      return { parsed: JSON.parse(cleaned), model };
+    } catch (err) {
+      lastErr = err;
+      console.error(`Gemini ${model} failed:`, err?.message || err);
+    }
   }
-  const data = await resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Gemini returned empty response');
-  return JSON.parse(text);
+  throw lastErr || new Error('All Gemini models failed');
 }
 
 async function inspectImageForensics({ imageBase64, mimeType = 'image/jpeg', fileName = '', description = '', sourceChannel = 'Mobile App', sampleTag = '' }) {
@@ -531,8 +535,9 @@ async function inspectImageForensics({ imageBase64, mimeType = 'image/jpeg', fil
   }
 
   const telemetry = extractImageBinaryTelemetry(bytes, cleanB64);
+  let aiFallbackReason = '';
 
-  if (geminiKey) {
+  if (aiClient) {
     try {
       const normalizedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(mimeType.toLowerCase())
         ? mimeType.toLowerCase()
@@ -542,39 +547,30 @@ async function inspectImageForensics({ imageBase64, mimeType = 'image/jpeg', fil
             ? 'image/webp'
             : 'image/jpeg';
 
-      const prompt = `You are VeriLens AI, an expert digital media forensics analyst specializing in detecting AI-generated images (Midjourney, DALL-E, Flux, Stable Diffusion, Imagen, Gemini), deepfakes, photo tampering, and out-of-context social media claims.
+      const prompt = `You are VeriLens AI, an expert digital media forensics analyst. Your job is to accurately distinguish REAL everyday photographs from AI-GENERATED images (Midjourney, DALL-E, Flux, Stable Diffusion, Imagen, Gemini) and digitally manipulated/deepfake photos.
 
-Analyze the attached image carefully at pixel & semantic level:
-1. Check for AI-generation artifacts: deformed or extra fingers/hands, asymmetric ears/eyes/pupils, unnatural glossy/plastic skin pores, garbled or distorted background text/letters, impossible architectural geometry, inconsistent shadows/reflections, painterly bokeh, or synthetic symmetry.
-2. Check for photo manipulation / splicing / fake screenshots: mismatched lighting edges, copy-paste seams, UI font anomalies, overlaid fake news banners.
-3. Evaluate Binary Metadata Telemetry extracted from the file header:
-   - Format: ${telemetry.formatLabel}, Size: ${telemetry.approxKb} KB, Entropy: ${telemetry.entropy} bits/byte
-   - EXIF Header Present: ${telemetry.hasExifHeader}
-   - Camera Brand Marker: ${telemetry.cameraBrand || 'None'}
-   - AI Generator Metadata Marker: ${telemetry.aiSoftware || 'None'}
-   - Editing Software Marker: ${telemetry.editorSoftware || 'None'}
-   - C2PA Content Credentials: ${telemetry.hasC2pa}
-4. Evaluate Cross-Modal Context (Source Channel: "${sourceChannel}"):
-   - User's Written Claim / Caption: "${description.trim() || '(none provided)'}"
-   - Filename hint: "${fileName}"
+IMPORTANT CALIBRATION:
+- Note that mobile apps and social apps (WhatsApp, Instagram, Flutter image_picker) often strip EXIF metadata from completely genuine real-world photos. So DO NOT mark a normal photo as Suspicious or Fake just because EXIF is missing! Judge the ACTUAL VISUAL PIXELS first!
+- Look at real-world signs of authenticity: natural camera sensor noise/grain, ordinary everyday imperfections (clutter, uneven lighting, realistic shadows, natural skin pores, coherent reflections, readable real-world text, plausible geometry). If it looks like a genuine camera photograph of a real scene/object/person and matches the caption, classify it as "Real" with high confidence (85-98).
+- Classify as "Fake" if you observe clear AI/deepfake artifacts: distorted/extra fingers or hands, glossy airbrushed plastic skin, garbled/nonsense background text, impossible anatomy or architecture, mismatched reflections/shadows, synthetic painterly rendering, obvious face-swap seams, or AI generator metadata ("${telemetry.aiSoftware || 'none'}").
+- Classify as "Suspicious" ONLY if the visual evidence is genuinely ambiguous (heavily blurred/cropped, likely edited screenshot/meme overlay, or the written claim clearly contradicts what is visible in the photo).
 
-Classification rules:
-- Return "Fake" if you see clear AI-generation artifacts, deepfake signs, synthetic metadata, or obvious digital fabrication.
-- Return "Real" if it appears to be a genuine unmanipulated photograph/capture with coherent real-world physics/lighting/anatomy AND matches the claim (or no conflicting claim).
-- Return "Suspicious" if the image is heavily compressed/re-encoded/ambiguous, a cropped screenshot without provenance, or the written claim appears misleading/out-of-context.
-Return strictly valid JSON with confidence (55-99), concise summary, 3-4 specific visualSignals observed directly in THIS image, textConsistency, and cumoNote.`;
+Metadata Telemetry:
+- Format: ${telemetry.formatLabel}, Size: ${telemetry.approxKb} KB, Entropy: ${telemetry.entropy}
+- EXIF Header: ${telemetry.hasExifHeader}, Camera Brand: ${telemetry.cameraBrand || 'Stripped/None'}, AI Tag: ${telemetry.aiSoftware || 'None'}, Editor Tag: ${telemetry.editorSoftware || 'None'}
+- Source Channel: "${sourceChannel}"
+- Written Claim / Caption: "${description.trim() || '(none provided)'}"
 
-      const aiVerdict = await analyzeWithGemini({
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: normalizedMime, data: cleanB64 } },
-        ],
-      });
-      if (aiVerdict) {
-        return normalizeVerdict(aiVerdict, 'Gemini 2.5 Flash Multimodal');
-      }
+Return JSON strictly with "classification" set to exactly one of "Real", "Fake", or "Suspicious", integer "confidence" (60-99), a clear "summary" describing what is actually seen in the image, 3-4 specific "visualSignals" observed directly in this photo, "textConsistency", and "cumoNote".`;
+
+      const { parsed, model } = await analyzeWithGemini([
+        { inlineData: { mimeType: normalizedMime, data: cleanB64 } },
+        { text: prompt },
+      ]);
+      return normalizeVerdict(parsed, `Gemini AI (${model})`);
     } catch (err) {
-      console.error('Gemini image fallback:', err.message);
+      aiFallbackReason = String(err?.message || err).slice(0, 120);
+      console.error('Gemini image fallback:', aiFallbackReason);
     }
   }
 
@@ -588,7 +584,7 @@ Return strictly valid JSON with confidence (55-99), concise summary, 3-4 specifi
       summary: `Embedded AI generator metadata ("${telemetry.aiSoftware}") found inside ${telemetry.formatLabel} (${telemetry.approxKb} KB).`,
       visualSignals: [
         `Binary chunk signature matched "${telemetry.aiSoftware}"`,
-        `File entropy ${telemetry.entropy} bits/byte · ${telemetry.approxKb} KB`,
+        `File entropy ${telemetry.entropy} bits/byte - ${telemetry.approxKb} KB`,
         telemetry.hasExifHeader ? 'Synthetic/modified EXIF container' : 'Missing physical camera sensor EXIF tags',
       ],
       textConsistency: description.trim() ? 'Claim conflicts with embedded AI generation signature.' : 'AI software metadata confirms synthetic origin.',
@@ -599,7 +595,7 @@ Return strictly valid JSON with confidence (55-99), concise summary, 3-4 specifi
   if (telemetry.hasExifHeader && telemetry.cameraBrand && !telemetry.editorSoftware && !urgentSocial) {
     return {
       classification: 'Real',
-      confidence: 88,
+      confidence: 89,
       summary: `Hardware camera EXIF metadata ("${telemetry.cameraBrand}") verified in ${telemetry.formatLabel} (${telemetry.approxKb} KB) with no AI generator signatures.`,
       visualSignals: [
         `Camera hardware marker "${telemetry.cameraBrand}" preserved in EXIF header`,
@@ -614,16 +610,16 @@ Return strictly valid JSON with confidence (55-99), concise summary, 3-4 specifi
   return {
     classification: 'Suspicious',
     confidence: 74,
-    summary: `${telemetry.formatLabel} (${telemetry.approxKb} KB) lacks verifiable hardware camera EXIF provenance${telemetry.editorSoftware ? ` and shows "${telemetry.editorSoftware}" processing markers` : ''}. Cannot confirm authenticity from metadata alone.`,
+    summary: `${telemetry.formatLabel} (${telemetry.approxKb} KB) lacks verifiable hardware camera EXIF provenance${telemetry.editorSoftware ? ` and shows "${telemetry.editorSoftware}" processing markers` : ''}.`,
     visualSignals: [
-      telemetry.hasExifHeader ? 'EXIF header present without recognized camera hardware Make/Model' : 'Original hardware camera EXIF metadata stripped (common in AI exports & social forwards)',
-      telemetry.editorSoftware ? `Editing/re-encoding software tag found: "${telemetry.editorSoftware}"` : `Entropy ${telemetry.entropy} bits/byte · ${telemetry.formatLabel} container`,
-      geminiKey ? 'Fallback binary check triggered' : 'Tip: Set GEMINI_API_KEY in Vercel for pixel-level AI deepfake inspection',
+      telemetry.hasExifHeader ? 'EXIF header present without recognized camera Make/Model' : 'Camera EXIF metadata stripped (common in re-encoded mobile/social photos)',
+      `Entropy ${telemetry.entropy} bits/byte - ${telemetry.formatLabel} container`,
+      aiFallbackReason ? `AI fallback note: ${aiFallbackReason}` : 'Set GEMINI_API_KEY in Vercel for pixel-level AI verification',
     ],
     textConsistency: urgentSocial
       ? 'Urgent viral claim requires independent source verification.'
       : 'Visual provenance unverified due to stripped camera metadata.',
-    cumoNote: `Marked Suspicious: stripped/missing camera provenance (${sourceChannel}) [Engine: Binary Forensics].`,
+    cumoNote: `Marked Suspicious (${sourceChannel}) [Engine: Binary Forensics].`,
   };
 }
 
@@ -663,8 +659,9 @@ async function inspectVoiceForensics({ audioBase64 = '', fileName = '', mimeType
   }
 
   const telemetry = extractAudioBinaryTelemetry(bytes, mimeType);
+  let aiFallbackReason = '';
 
-  if (geminiKey) {
+  if (aiClient) {
     try {
       const normalizedAudioMime = mimeType.toLowerCase().includes('mp3') || mimeType.toLowerCase().includes('mpeg')
         ? 'audio/mp3'
@@ -676,32 +673,26 @@ async function inspectVoiceForensics({ audioBase64 = '', fileName = '', mimeType
               ? 'audio/webm'
               : 'audio/wav';
 
-      const prompt = `You are VeriLens AI, an expert audio forensics specialist detecting AI voice clones (ElevenLabs, OpenAI TTS, Bark, VALL-E, RVC), synthetic speech, spliced audio, and voice-phishing scams.
+      const prompt = `You are VeriLens AI, an expert audio forensics specialist detecting AI voice clones (ElevenLabs, OpenAI TTS, Bark, VALL-E, RVC), synthetic speech, and voice-phishing scams.
 
-Analyze the attached audio recording (and/or spoken claim):
-1. Listen closely to acoustic & vocal markers: robotic/metallic vocoder buzz, unnaturally smooth/uniform pitch & cadence, missing natural breath inhalations, abrupt room-tone cuts/splices, or unnatural pronunciation glitches.
-2. Container & Signal Telemetry:
-   - Container: ${telemetry.container}, Size: ${telemetry.approxKb} KB, Entropy: ${telemetry.entropy} bits/byte
-   - WAV Info: ${telemetry.wavInfo ? `${telemetry.wavInfo.sampleRate} Hz, ${telemetry.wavInfo.channels} ch, ${telemetry.wavInfo.bitsPerSample}-bit, ~${telemetry.wavInfo.durationSec}s` : 'Compressed container'}
-   - Silence byte ratio: ${telemetry.silenceByteRatio}, Encoder tag: ${telemetry.encoderTag || 'None'}
-3. Spoken Claim / Context provided by user: "${transcriptOrClaim.trim() || '(none provided)'}" (Source: ${sourceChannel})
+Listen closely to the attached audio (and/or spoken claim):
+- Classify as "Real" if it sounds like genuine natural human speech (organic breath pauses, micro-pitch jitter, natural room ambiance, authentic human emotion/imperfections) and is not a synthetic clone.
+- Classify as "Fake" if you hear robotic/metallic neural vocoder buzz, unnaturally uniform TTS cadence, zero natural breathing, spliced room-tone cuts, or synthetic voice cloning.
+- Classify as "Suspicious" if heavy compression/short duration makes it inconclusive OR if it is an urgent financial/OTP scam request requiring callback verification.
 
-Classification rules:
-- "Fake": Clear synthetic TTS / AI voice cloning artifacts OR explicit AI-generated voice indicators.
-- "Real": Natural human speech with organic breath pauses, natural pitch variation, and authentic ambient noise floor.
-- "Suspicious": Heavy WhatsApp/social compression, too short/noisy to be conclusive, OR urgent financial/OTP scam request needing out-of-band callback verification.
-Return strictly valid JSON.`;
+Telemetry: Container ${telemetry.container}, ${telemetry.approxKb} KB, Entropy ${telemetry.entropy}${telemetry.wavInfo ? `, WAV ${telemetry.wavInfo.sampleRate}Hz ${telemetry.wavInfo.channels}ch` : ''}, Encoder tag: ${telemetry.encoderTag || 'None'}.
+User Claim/Transcript: "${transcriptOrClaim.trim() || '(none provided)'}" (Source: ${sourceChannel})
+Return JSON strictly with classification ("Real" | "Fake" | "Suspicious"), integer confidence (60-99), summary, 3-4 visualSignals, textConsistency, and cumoNote.`;
 
       const parts = [{ text: prompt }];
       if (cleanB64 && bytes.length > 64) {
-        parts.push({ inline_data: { mime_type: normalizedAudioMime, data: cleanB64 } });
+        parts.unshift({ inlineData: { mimeType: normalizedAudioMime, data: cleanB64 } });
       }
-      const aiVerdict = await analyzeWithGemini({ parts });
-      if (aiVerdict) {
-        return normalizeVerdict(aiVerdict, 'Gemini 2.5 Flash Audio');
-      }
+      const { parsed, model } = await analyzeWithGemini(parts);
+      return normalizeVerdict(parsed, `Gemini Audio (${model})`);
     } catch (err) {
-      console.error('Gemini voice fallback:', err.message);
+      aiFallbackReason = String(err?.message || err).slice(0, 120);
+      console.error('Gemini voice fallback:', aiFallbackReason);
     }
   }
 
@@ -717,7 +708,7 @@ Return strictly valid JSON.`;
       summary: `Synthetic speech indicator ("${telemetry.encoderTag || 'TTS marker'}") detected in ${telemetry.container} (${telemetry.approxKb} KB).`,
       visualSignals: [
         `Encoder/tool signature: ${telemetry.encoderTag || 'TTS/Clone keyword match'}`,
-        `Audio entropy ${telemetry.entropy} bits/byte · Silence ratio ${telemetry.silenceByteRatio}`,
+        `Audio entropy ${telemetry.entropy} bits/byte - Silence ratio ${telemetry.silenceByteRatio}`,
         telemetry.wavInfo ? `PCM ${telemetry.wavInfo.sampleRate} Hz / ${telemetry.wavInfo.channels}ch` : `Container: ${telemetry.container}`,
       ],
       textConsistency: 'Audio markers point to synthetic speech generation.',
@@ -730,18 +721,18 @@ Return strictly valid JSON.`;
     confidence: isScamClaim ? 81 : 70,
     summary: isScamClaim
       ? `Audio (${telemetry.approxKb} KB) accompanies high-risk urgent/financial phrasing. Verify caller identity independently.`
-      : `Audio container (${telemetry.container}, ${telemetry.approxKb} KB) inspected at signal level, but neural vocoder verification requires Gemini AI (set GEMINI_API_KEY in Vercel).`,
+      : `Audio container (${telemetry.container}, ${telemetry.approxKb} KB) inspected at signal level.`,
     visualSignals: [
       telemetry.wavInfo
         ? `WAV PCM ${telemetry.wavInfo.sampleRate} Hz, ${telemetry.wavInfo.channels} ch, ~${telemetry.wavInfo.durationSec}s`
         : `Container ${telemetry.container} (${telemetry.approxKb} KB)`,
-      `Byte entropy ${telemetry.entropy} bits/byte · Zero-byte silence ratio ${telemetry.silenceByteRatio}`,
-      geminiKey ? 'Fallback signal check used' : 'Tip: Add free GEMINI_API_KEY in Vercel for real waveform AI clone detection',
+      `Byte entropy ${telemetry.entropy} bits/byte - Silence ratio ${telemetry.silenceByteRatio}`,
+      aiFallbackReason ? `AI fallback note: ${aiFallbackReason}` : 'Set GEMINI_API_KEY in Vercel for AI waveform clone detection',
     ],
     textConsistency: isScamClaim
       ? 'High-urgency or financial request requires callback verification.'
-      : 'Acoustic signal parsed; AI waveform inspection not configured.',
-    cumoNote: `Marked Suspicious pending AI acoustic confirmation (${sourceChannel}) [Engine: Signal Forensics].`,
+      : 'Acoustic signal parsed; AI waveform inspection fallback used.',
+    cumoNote: `Marked Suspicious (${sourceChannel}) [Engine: Signal Forensics].`,
   };
 }
 
@@ -750,30 +741,33 @@ app.get('/', (_req, res) => {
     ok: true,
     service: 'verilens-vercel-api',
     storage: storageMode(),
-    aiEngine: geminiKey ? 'gemini-2.5-flash' : 'binary-signal-fallback',
+    aiEngine: geminiKey ? 'gemini-multimodal-sdk' : 'binary-signal-fallback',
     otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
-    endpoints: [
-      '/api/health',
-      '/api/auth/send-register-otp',
-      '/api/auth/register',
-      '/api/auth/login',
-      '/api/auth/forgot-password',
-      '/api/auth/reset-password',
-      '/api/auth/delete-account',
-      '/api/analyze',
-      '/api/analyze-voice',
-      '/api/scans',
-      '/api/apk/track',
-    ],
   });
 });
 
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (req, res) => {
+  let aiProbe = geminiKey ? 'configured' : 'missing-key';
+  if (req.query?.probe === '1' && aiClient) {
+    for (const model of GEMINI_MODELS) {
+      try {
+        const r = await aiClient.models.generateContent({
+          model,
+          contents: 'Reply with OK',
+        });
+        aiProbe = `ok (${model}: ${(r.text || '').trim().slice(0, 20)})`;
+        break;
+      } catch (e) {
+        aiProbe = `error (${model}: ${String(e?.message || e).slice(0, 140)})`;
+      }
+    }
+  }
   res.json({
     ok: true,
     service: 'verilens-vercel-api',
     storage: storageMode(),
-    aiEngine: geminiKey ? 'gemini-2.5-flash' : 'binary-signal-fallback',
+    aiEngine: geminiKey ? 'gemini-multimodal-sdk' : 'binary-signal-fallback',
+    aiProbe,
     otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
   });
 });
