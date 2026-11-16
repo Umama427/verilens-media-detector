@@ -355,4 +355,20 @@ class ApiService {
     }
     return 1;
   }
+
+  static Future<void> deleteAccount({required String token}) async {
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/api/auth/delete-account'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    final decoded = _safeJsonMap(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(decoded['error'] ?? 'Could not delete account.');
+    }
+  }
 }

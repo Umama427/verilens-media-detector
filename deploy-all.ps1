@@ -34,7 +34,7 @@ if (Test-Path $AdbExe) {
   if ($devices -match "emulator-5554\s+device") {
     Write-Host "==> 3/4 Installing & Launching APK on emulator-5554..." -ForegroundColor Cyan
     & $AdbExe -s emulator-5554 install -r $BuiltApk
-    & $AdbExe -s emulator-5554 shell monkey -p com.example.media_verify_ai -c android.intent.category.LAUNCHER 1
+    & $AdbExe -s emulator-5554 shell monkey -p com.verilens.forensics -c android.intent.category.LAUNCHER 1
   } else {
     Write-Host "  [i] emulator-5554 not running; direct APK ready at $DirectApkDest" -ForegroundColor Yellow
   }

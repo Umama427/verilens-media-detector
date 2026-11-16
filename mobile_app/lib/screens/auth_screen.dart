@@ -372,9 +372,9 @@ class _AuthScreenState extends State<AuthScreen> {
         children: [
           SegmentedButton<AuthMode>(
             segments: const [
-              ButtonSegment(value: AuthMode.login, label: Text('Login')),
-              ButtonSegment(value: AuthMode.register, label: Text('Register')),
-              ButtonSegment(value: AuthMode.forgot, label: Text('Forgot')),
+              ButtonSegment(value: AuthMode.login, label: Text('Login', maxLines: 1, softWrap: false)),
+              ButtonSegment(value: AuthMode.register, label: Text('Register', maxLines: 1, softWrap: false)),
+              ButtonSegment(value: AuthMode.forgot, label: Text('Forgot', maxLines: 1, softWrap: false)),
             ],
             selected: {_mode},
             onSelectionChanged: (val) => setState(() {

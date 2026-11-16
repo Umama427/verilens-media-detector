@@ -1875,7 +1875,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 6),
               const Text(
-                'Share VeriLens Android APK v1.0.0+1 or verify live Vercel backend connectivity.',
+                'VeriLens AI v1.0.1+2 · Play Store & Cloud Ready. Share app or verify backend status.',
                 style: TextStyle(fontSize: 13, color: Color(0xFF475569)),
               ),
               const SizedBox(height: 14),
@@ -1919,6 +1919,84 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 icon: const Icon(Icons.cloud_done_outlined),
                 label: const Text('Test Cloud Backend Connection'),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: () {
+                  showDialog<void>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Privacy Policy & AI Notice'),
+                      content: const SingleChildScrollView(
+                        child: Text(
+                          'VeriLens AI collects your name and email solely for OTP authentication and account recovery.\n\n'
+                          'Images, audio clips, and captions you submit are transmitted securely via HTTPS to our Vercel forensic API (powered by multimodal AI and metadata inspection) to generate authenticity reports. We do not sell personal data or display third-party ads.\n\n'
+                          'AI Disclaimer: Forensic confidence scores assist verification and should be paired with human judgment for critical decisions.\n\n'
+                          'You may permanently delete your account anytime from this screen.',
+                        ),
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          child: const Text('Close'),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(46),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                icon: const Icon(Icons.privacy_tip_outlined),
+                label: const Text('Privacy Policy & AI Disclosure'),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final confirm = await showDialog<bool>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Delete Account?'),
+                      content: const Text(
+                        'This will permanently remove your VeriLens AI account from cloud storage. This action cannot be undone.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(ctx, false),
+                          child: const Text('Cancel'),
+                        ),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                              backgroundColor: const Color(0xFFB91C1C)),
+                          onPressed: () => Navigator.pop(ctx, true),
+                          child: const Text('Delete'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (confirm != true) return;
+                  try {
+                    await ApiService.deleteAccount(token: widget.user.token);
+                    if (!mounted) return;
+                    widget.onLogout();
+                  } catch (e) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(e.toString())),
+                    );
+                  }
+                },
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFB91C1C),
+                  side: const BorderSide(color: Color(0xFFFECACA)),
+                  minimumSize: const Size.fromHeight(46),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                icon: const Icon(Icons.delete_forever_outlined),
+                label: const Text('Delete My Account'),
               ),
             ],
           ),

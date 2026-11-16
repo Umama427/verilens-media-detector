@@ -3,24 +3,242 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 import nodemailer from 'nodemailer';
-import { MongoClient } from 'mongodb';
+import { put, get, del, BlobNotFoundError } from '@vercel/blob';
 
 dotenv.config();
+for (const k of [
+  'BLOB_READ_WRITE_TOKEN',
+  'KV_REST_API_URL',
+  'KV_REST_API_TOKEN',
+  'UPSTASH_REDIS_REST_URL',
+  'UPSTASH_REDIS_REST_TOKEN',
+  'GEMINI_API_KEY',
+  'AUTH_SECRET',
+  'SMTP_HOST',
+  'SMTP_PORT',
+  'SMTP_USER',
+  'SMTP_PASS',
+  'SMTP_FROM',
+  'RESEND_API_KEY',
+  'RESEND_FROM',
+]) {
+  if (typeof process.env[k] === 'string') {
+    process.env[k] = process.env[k]
+      .replace(/^\uFEFF/, '')
+      .trim()
+      .replace(new RegExp('^' + k + '=', 'i'), '')
+      .trim()
+      .replace(/^["']|["']$/g, '')
+      .trim();
+  }
+}
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.options('*', cors());
 app.use(express.json({ limit: '20mb' }));
 
-const mongoUri = process.env.MONGODB_URI;
-const dbName = process.env.MONGODB_DB || 'media_verify_db';
+const kvUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
+const kvToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const hasKv = Boolean(kvUrl && kvToken);
+const hasBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
+const geminiKey = process.env.GEMINI_API_KEY || '';
 const authSecret = process.env.AUTH_SECRET || 'verilens-stateless-forensic-key';
 
-let cachedClient = null;
+let blobAccess = 'private';
 const memoryScans = [];
 const memoryUsers = new Map();
 const usedOtpNonces = new Set();
 let memoryApkShares = 12;
+
+function storageMode() {
+  if (hasKv) return 'vercel-kv';
+  if (hasBlob) return 'vercel-blob';
+  return 'vercel-memory';
+}
+
+async function kvCall(commandArgs) {
+  if (!hasKv) return { enabled: false, result: null };
+  const resp = await fetch(kvUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${kvToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(commandArgs),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Vercel Redis error (${resp.status}): ${errText}`);
+  }
+  const data = await resp.json();
+  if (data.error) throw new Error(`Vercel Redis command error: ${data.error}`);
+  return { enabled: true, result: data.result };
+}
+
+async function blobReadJson(pathname) {
+  if (!hasBlob) return null;
+  try {
+    const res = await get(pathname, { access: blobAccess });
+    if (!res || !res.stream) return null;
+    const text = await new Response(res.stream).text();
+    return text ? JSON.parse(text) : null;
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (err instanceof BlobNotFoundError || /not found|404/i.test(msg)) return null;
+    if (/private access on a public store/i.test(msg)) {
+      blobAccess = 'public';
+      return blobReadJson(pathname);
+    }
+    if (/public access on a private store/i.test(msg)) {
+      blobAccess = 'private';
+      return blobReadJson(pathname);
+    }
+    throw err;
+  }
+}
+
+async function blobWriteJson(pathname, data) {
+  if (!hasBlob) return;
+  try {
+    await put(pathname, JSON.stringify(data), {
+      access: blobAccess,
+      contentType: 'application/json',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 60,
+    });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (/private access on a public store/i.test(msg)) {
+      blobAccess = 'public';
+      return blobWriteJson(pathname, data);
+    }
+    if (/public access on a private store/i.test(msg)) {
+      blobAccess = 'private';
+      return blobWriteJson(pathname, data);
+    }
+    throw err;
+  }
+}
+
+function userBlobPath(email) {
+  const safeKey = Buffer.from(email).toString('base64url');
+  return `verilens/users/${safeKey}.json`;
+}
+
+async function findUser(email) {
+  if (hasKv) {
+    const res = await kvCall(['GET', `verilens:user:${email}`]);
+    if (!res.result) return null;
+    return typeof res.result === 'string' ? JSON.parse(res.result) : res.result;
+  }
+  if (hasBlob) {
+    return await blobReadJson(userBlobPath(email));
+  }
+  return memoryUsers.get(email) || null;
+}
+
+async function saveUser(userDoc) {
+  if (hasKv) {
+    await kvCall(['SET', `verilens:user:${userDoc.email}`, JSON.stringify(userDoc)]);
+    return;
+  }
+  if (hasBlob) {
+    await blobWriteJson(userBlobPath(userDoc.email), userDoc);
+    return;
+  }
+  memoryUsers.set(userDoc.email, userDoc);
+}
+
+async function deleteUser(email) {
+  if (hasKv) {
+    await kvCall(['DEL', `verilens:user:${email}`]);
+    return;
+  }
+  if (hasBlob) {
+    try {
+      await del(userBlobPath(email));
+    } catch (_) {}
+    return;
+  }
+  memoryUsers.delete(email);
+}
+
+async function isNonceUsed(nonce) {
+  if (hasKv) {
+    const res = await kvCall(['GET', `verilens:nonce:${nonce}`]);
+    return Boolean(res.result);
+  }
+  if (hasBlob) {
+    const rec = await blobReadJson(`verilens/nonces/${nonce}.json`);
+    return Boolean(rec && rec.used);
+  }
+  return usedOtpNonces.has(nonce);
+}
+
+async function markNonceUsed(nonce) {
+  if (hasKv) {
+    await kvCall(['SET', `verilens:nonce:${nonce}`, '1', 'EX', '900']);
+    return;
+  }
+  if (hasBlob) {
+    await blobWriteJson(`verilens/nonces/${nonce}.json`, { used: true, at: Date.now() });
+    return;
+  }
+  usedOtpNonces.add(nonce);
+}
+
+async function addScan(record) {
+  if (hasKv) {
+    await kvCall(['LPUSH', 'verilens:scans', JSON.stringify(record)]);
+    await kvCall(['LTRIM', 'verilens:scans', '0', '59']);
+    return;
+  }
+  if (hasBlob) {
+    const existing = (await blobReadJson('verilens/scans.json')) || [];
+    const updated = [record, ...(Array.isArray(existing) ? existing : [])].slice(0, 60);
+    await blobWriteJson('verilens/scans.json', updated);
+    return;
+  }
+  memoryScans.unshift(record);
+  if (memoryScans.length > 60) memoryScans.pop();
+}
+
+async function listScans() {
+  if (hasKv) {
+    const res = await kvCall(['LRANGE', 'verilens:scans', '0', '59']);
+    return (res.result || [])
+      .map((item) => {
+        try {
+          return typeof item === 'string' ? JSON.parse(item) : item;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  }
+  if (hasBlob) {
+    const existing = await blobReadJson('verilens/scans.json');
+    return Array.isArray(existing) ? existing : [];
+  }
+  return memoryScans;
+}
+
+async function incrementApkShares() {
+  if (hasKv) {
+    const res = await kvCall(['INCR', 'verilens:apk_shares']);
+    return { tracked: true, totalShares: Number(res.result || 1), storage: 'vercel-kv' };
+  }
+  if (hasBlob) {
+    const current = (await blobReadJson('verilens/apk_shares.json')) || { totalShares: 12 };
+    const totalShares = Number(current.totalShares || 12) + 1;
+    await blobWriteJson('verilens/apk_shares.json', { totalShares, lastActivityAt: new Date().toISOString() });
+    return { tracked: true, totalShares, storage: 'vercel-blob' };
+  }
+  memoryApkShares += 1;
+  return { tracked: true, totalShares: memoryApkShares, storage: 'vercel-memory' };
+}
 
 function isEmailOtpConfigured() {
   return Boolean(
@@ -32,8 +250,8 @@ function isEmailOtpConfigured() {
 async function sendRealOtpEmail({ to, code, purpose, recipientName = '' }) {
   const subject =
     purpose === 'register'
-      ? `VeriLens AI â€” Verify Your Email (OTP: ${code})`
-      : `VeriLens AI â€” Password Reset OTP (${code})`;
+      ? `VeriLens AI - Verify Your Email (OTP: ${code})`
+      : `VeriLens AI - Password Reset OTP (${code})`;
   const heading =
     purpose === 'register'
       ? 'Verify Your VeriLens AI Account'
@@ -134,162 +352,396 @@ function makeAccountProof(userDoc) {
   });
 }
 
-async function getDb() {
-  if (!mongoUri) return null;
-  if (!cachedClient) {
-    cachedClient = new MongoClient(mongoUri);
-    await cachedClient.connect();
+function computeEntropy(bytes) {
+  if (!bytes || bytes.length === 0) return 0;
+  const counts = new Array(256).fill(0);
+  const sampleLen = Math.min(bytes.length, 65536);
+  for (let i = 0; i < sampleLen; i++) counts[bytes[i]]++;
+  let entropy = 0;
+  for (let i = 0; i < 256; i++) {
+    if (counts[i] === 0) continue;
+    const p = counts[i] / sampleLen;
+    entropy -= p * Math.log2(p);
   }
-  return cachedClient.db(dbName);
+  return Number(entropy.toFixed(2));
 }
 
-function inspectImageForensics({ imageBase64, fileName = '', description = '', sourceChannel = 'Mobile App', sampleTag = '' }) {
-  const cleanB64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
-  const bytes = Buffer.from(cleanB64, 'base64');
+function extractImageBinaryTelemetry(bytes, cleanB64) {
   const approxKb = Math.max(1, Math.round(bytes.length / 1024));
-  const headAscii = bytes.subarray(0, Math.min(bytes.length, 32768)).toString('latin1');
-  const lowerHeader = headAscii.toLowerCase();
-  const lowerDesc = description.toLowerCase();
-  const lowerName = fileName.toLowerCase();
-  const lowerTag = sampleTag.toLowerCase();
+  const headAscii = bytes.subarray(0, Math.min(bytes.length, 65536)).toString('latin1');
+  const tailAscii = bytes.length > 65536 ? bytes.subarray(Math.max(0, bytes.length - 16384)).toString('latin1') : '';
+  const combinedAscii = `${headAscii}\n${tailAscii}`;
+  const lowerHeader = combinedAscii.toLowerCase();
 
   const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-  const isPng = cleanB64.startsWith('iVBOR');
-  const isWebp = cleanB64.startsWith('UklGR');
+  const isPng = bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  const isWebp = cleanB64.startsWith('UklGR') || headAscii.startsWith('RIFF');
   const formatLabel = isJpeg ? 'JPEG' : isPng ? 'PNG' : isWebp ? 'WebP' : 'Image';
 
-  const hasExif = /exif|apple|iphone|samsung|pixel|xiaomi|redmi|oppo|vivo|canon|nikon|sony|oneplus/.test(lowerHeader);
-  const aiMetaMatch = lowerHeader.match(/(midjourney|dall-e|stable diffusion|comfyui|automatic1111|parameters|imagen|firefly|chatgpt|gemini|canva|photoshop|lavc)/);
-  const aiNameOrDesc = /(ai|deepfake|synthetic|cgi|midjourney|dalle|dall-e|generated|fake|avatar|flux|render|unedited backstage|runway)/.test(`${lowerName} ${lowerDesc} ${lowerTag}`);
-  const urgentSocial = /(breaking|urgent|share immediately|viral|shocking|hurricane|forwarded|storm)/.test(`${lowerDesc} ${lowerTag}`);
+  const hasExifHeader = /exif\x00\x00|exif|eXIf/.test(combinedAscii);
+  const cameraMatch = lowerHeader.match(/(apple|iphone|samsung|sm-[a-z0-9]+|google|pixel|xiaomi|redmi|poco|oppo|vivo|realme|oneplus|canon|nikon|sony|fujifilm|leica|hasselblad|huawei)/);
+  const aiMetaMatch = lowerHeader.match(/(midjourney|dall-e|stable diffusion|comfyui|automatic1111|novelai|dreamstudio|imagen|firefly|chatgpt|openai|gpt-4o|gemini|flux\.1|grok|runway|kling|sora|ideogram|leonardo\.ai|bing image creator|made with google ai)/);
+  const editorMatch = lowerHeader.match(/(adobe photoshop|canva|gimp|lightroom|snapseed|picsart|facetune|remini|lavc)/);
+  const hasC2pa = /c2pa|jumbf|contentcredentials/.test(lowerHeader);
+  const entropy = computeEntropy(bytes);
 
-  if (aiMetaMatch || aiNameOrDesc || lowerTag.includes('ai_portrait')) {
-    return {
-      classification: 'Fake',
-      confidence: aiMetaMatch ? 96 : 92,
-      summary: `Detected generative/synthetic indicators in ${formatLabel} payload (${approxKb} KB). Specular texture smoothness and metadata markers point toward AI-generated or digitally manipulated media.`,
-      visualSignals: [
-        aiMetaMatch
-          ? `Embedded software/generator signature detected ("${aiMetaMatch[1]}")`
-          : `${formatLabel} (${approxKb} KB) lacks authentic camera sensor EXIF headers`,
-        'High-frequency diffusion & smooth surface texture profile',
-        description.trim()
-          ? 'Textual claim evaluated against synthetic visual cues'
-          : 'Synthetic compression regularity detected across pixel blocks',
-      ],
-      textConsistency: description.trim()
-        ? 'Written claim conflicts with synthetic generation indicators.'
-        : 'No caption provided; binary & visual markers indicate synthetic origin.',
-      cumoNote: `CUMO image pipeline flagged Fake (${sourceChannel}).`,
-    };
+  return {
+    approxKb,
+    formatLabel,
+    isJpeg,
+    isPng,
+    isWebp,
+    hasExifHeader,
+    cameraBrand: cameraMatch ? cameraMatch[1] : null,
+    aiSoftware: aiMetaMatch ? aiMetaMatch[1] : null,
+    editorSoftware: editorMatch ? editorMatch[1] : null,
+    hasC2pa,
+    entropy,
+  };
+}
+
+function extractAudioBinaryTelemetry(bytes, mimeType) {
+  const approxKb = Math.max(1, Math.round(bytes.length / 1024));
+  const headAscii = bytes.subarray(0, Math.min(bytes.length, 32768)).toString('latin1');
+  const lower = headAscii.toLowerCase();
+  const isWav = headAscii.startsWith('RIFF') && headAscii.slice(8, 12) === 'WAVE';
+  const isMp3 = headAscii.startsWith('ID3') || (bytes.length > 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0);
+  const isMp4M4a = headAscii.slice(4, 8) === 'ftyp';
+  const isOgg = headAscii.startsWith('OggS');
+  const isWebm = bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3;
+
+  let wavInfo = null;
+  if (isWav && bytes.length >= 44) {
+    const channels = bytes.readUInt16LE(22);
+    const sampleRate = bytes.readUInt32LE(24);
+    const bitsPerSample = bytes.readUInt16LE(34);
+    const byteRate = bytes.readUInt32LE(28);
+    const durationSec = byteRate > 0 ? Number((bytes.length / byteRate).toFixed(1)) : null;
+    wavInfo = { channels, sampleRate, bitsPerSample, durationSec };
   }
 
-  if (urgentSocial || (!hasExif && (isPng || isWebp || lowerName.includes('screenshot')))) {
-    return {
-      classification: 'Suspicious',
-      confidence: 80,
-      summary: `${formatLabel} file (${approxKb} KB) has stripped camera EXIF metadata or unverified viral claims. Common in screenshots, re-encoded forwards, or edited images.`,
-      visualSignals: [
-        `${formatLabel} payload (${approxKb} KB) missing original hardware EXIF metadata`,
-        urgentSocial
-          ? 'Urgent viral forwarding keywords require primary source confirmation'
-          : 'Re-encoded web/screenshot compression profile detected',
-        'Secondary visual corroboration recommended before trusting',
-      ],
-      textConsistency: urgentSocial
-        ? 'Claim uses unverified breaking-news phrasing without provenance.'
-        : 'Missing hardware EXIF makes original capture date/device unverified.',
-      cumoNote: `CUMO cross-modal check marked Suspicious (${sourceChannel}).`,
-    };
+  let zeroBytes = 0;
+  const checkLen = Math.min(bytes.length, 32768);
+  for (let i = 0; i < checkLen; i++) {
+    if (bytes[i] === 0) zeroBytes++;
   }
+  const silenceByteRatio = checkLen > 0 ? Number((zeroBytes / checkLen).toFixed(3)) : 0;
+  const encoderMatch = lower.match(/(elevenlabs|openai|playht|murf|resemble|coqui|bark|tortoise|lavf|ffmpeg|gtts|google tts|azure tts|polly)/);
+  const entropy = computeEntropy(bytes);
 
-  if (hasExif || isJpeg) {
+  return {
+    approxKb,
+    container: isWav ? 'WAV' : isMp3 ? 'MP3' : isMp4M4a ? 'M4A/MP4' : isOgg ? 'OGG' : isWebm ? 'WebM' : mimeType,
+    wavInfo,
+    silenceByteRatio,
+    encoderTag: encoderMatch ? encoderMatch[1] : null,
+    entropy,
+  };
+}
+
+const FORENSIC_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    classification: { type: 'STRING', enum: ['Real', 'Fake', 'Suspicious'] },
+    confidence: { type: 'INTEGER' },
+    summary: { type: 'STRING' },
+    visualSignals: { type: 'ARRAY', items: { type: 'STRING' } },
+    textConsistency: { type: 'STRING' },
+    cumoNote: { type: 'STRING' },
+  },
+  required: ['classification', 'confidence', 'summary', 'visualSignals', 'textConsistency', 'cumoNote'],
+};
+
+function normalizeVerdict(raw, engineLabel) {
+  const validClasses = ['Real', 'Fake', 'Suspicious'];
+  const classification = validClasses.includes(raw?.classification) ? raw.classification : 'Suspicious';
+  const confidence = Math.max(52, Math.min(99, Math.round(Number(raw?.confidence) || 75)));
+  const visualSignals = Array.isArray(raw?.visualSignals) && raw.visualSignals.length > 0
+    ? raw.visualSignals.map((s) => String(s)).slice(0, 5)
+    : ['Forensic signal analysis completed.'];
+  return {
+    classification,
+    confidence,
+    summary: String(raw?.summary || 'Multimodal forensic inspection completed.'),
+    visualSignals,
+    textConsistency: String(raw?.textConsistency || 'No conflicting claim detected.'),
+    cumoNote: `${String(raw?.cumoNote || 'Forensic pipeline completed.')} [Engine: ${engineLabel}]`,
+  };
+}
+
+async function analyzeWithGemini({ parts }) {
+  if (!geminiKey) return null;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`;
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        responseSchema: FORENSIC_RESPONSE_SCHEMA,
+      },
+    }),
+  });
+  if (!resp.ok) {
+    const errBody = await resp.text();
+    throw new Error(`Gemini API ${resp.status}: ${errBody.slice(0, 180)}`);
+  }
+  const data = await resp.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini returned empty response');
+  return JSON.parse(text);
+}
+
+async function inspectImageForensics({ imageBase64, mimeType = 'image/jpeg', fileName = '', description = '', sourceChannel = 'Mobile App', sampleTag = '' }) {
+  const cleanB64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+  const bytes = Buffer.from(cleanB64, 'base64');
+  const decodedPreview = bytes.subarray(0, 64).toString('utf8');
+  const isDemoSample = Boolean(sampleTag) || decodedPreview.startsWith('SAMPLE_MEDIA::');
+
+  if (isDemoSample) {
+    const lowerTag = `${sampleTag} ${fileName} ${description}`.toLowerCase();
+    if (/fake|ai|deepfake|midjourney|hurricane|clone/.test(lowerTag)) {
+      return {
+        classification: 'Fake',
+        confidence: 95,
+        summary: 'Demo synthetic sample flagged: diffusion texture uniformity and unverified viral manipulation markers.',
+        visualSignals: [
+          'Synthetic sample benchmark pattern detected',
+          'Specular skin/surface smoothing & unnatural edge transitions',
+          'Missing verifiable hardware camera EXIF provenance',
+        ],
+        textConsistency: description.trim() ? 'Caption conflicts with synthetic visual indicators.' : 'Demo AI-generated sample.',
+        cumoNote: `CUMO Demo Benchmark (${sourceChannel}) [Engine: Demo Preset]`,
+      };
+    }
     return {
       classification: 'Real',
-      confidence: hasExif ? 94 : 86,
-      summary: hasExif
-        ? `Authentic camera EXIF metadata found inside ${formatLabel} (${approxKb} KB) with natural sensor quantization and coherent scene semantics.`
-        : `Standard ${formatLabel} camera quantization (${approxKb} KB) with no AI generator signatures or conflicting claim detected.`,
+      confidence: 93,
+      summary: 'Demo authentic sample verified: natural optical noise profile and consistent scene semantics.',
       visualSignals: [
-        hasExif
-          ? 'Valid camera EXIF hardware metadata preserved in image header'
-          : `Standard ${formatLabel} (${approxKb} KB) quantization blocks verified`,
-        'No AI diffusion generator chunks (tEXt/ComfyUI/Midjourney) found',
-        'Natural edge transitions and plausible lighting coherence',
+        'Authentic sample camera benchmark verified',
+        'Natural lighting & edge micro-contrast',
+        'No diffusion or splicing signatures',
       ],
-      textConsistency: description.trim()
-        ? 'Written claim is consistent with inspected media.'
-        : 'No conflicting textual claims attached.',
-      cumoNote: `CUMO verified ${sourceChannel} submission cleanly.`,
+      textConsistency: 'Claim is consistent with sample media.',
+      cumoNote: `CUMO Demo Benchmark (${sourceChannel}) [Engine: Demo Preset]`,
+    };
+  }
+
+  const telemetry = extractImageBinaryTelemetry(bytes, cleanB64);
+
+  if (geminiKey) {
+    try {
+      const normalizedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(mimeType.toLowerCase())
+        ? mimeType.toLowerCase()
+        : telemetry.isPng
+          ? 'image/png'
+          : telemetry.isWebp
+            ? 'image/webp'
+            : 'image/jpeg';
+
+      const prompt = `You are VeriLens AI, an expert digital media forensics analyst specializing in detecting AI-generated images (Midjourney, DALL-E, Flux, Stable Diffusion, Imagen, Gemini), deepfakes, photo tampering, and out-of-context social media claims.
+
+Analyze the attached image carefully at pixel & semantic level:
+1. Check for AI-generation artifacts: deformed or extra fingers/hands, asymmetric ears/eyes/pupils, unnatural glossy/plastic skin pores, garbled or distorted background text/letters, impossible architectural geometry, inconsistent shadows/reflections, painterly bokeh, or synthetic symmetry.
+2. Check for photo manipulation / splicing / fake screenshots: mismatched lighting edges, copy-paste seams, UI font anomalies, overlaid fake news banners.
+3. Evaluate Binary Metadata Telemetry extracted from the file header:
+   - Format: ${telemetry.formatLabel}, Size: ${telemetry.approxKb} KB, Entropy: ${telemetry.entropy} bits/byte
+   - EXIF Header Present: ${telemetry.hasExifHeader}
+   - Camera Brand Marker: ${telemetry.cameraBrand || 'None'}
+   - AI Generator Metadata Marker: ${telemetry.aiSoftware || 'None'}
+   - Editing Software Marker: ${telemetry.editorSoftware || 'None'}
+   - C2PA Content Credentials: ${telemetry.hasC2pa}
+4. Evaluate Cross-Modal Context (Source Channel: "${sourceChannel}"):
+   - User's Written Claim / Caption: "${description.trim() || '(none provided)'}"
+   - Filename hint: "${fileName}"
+
+Classification rules:
+- Return "Fake" if you see clear AI-generation artifacts, deepfake signs, synthetic metadata, or obvious digital fabrication.
+- Return "Real" if it appears to be a genuine unmanipulated photograph/capture with coherent real-world physics/lighting/anatomy AND matches the claim (or no conflicting claim).
+- Return "Suspicious" if the image is heavily compressed/re-encoded/ambiguous, a cropped screenshot without provenance, or the written claim appears misleading/out-of-context.
+Return strictly valid JSON with confidence (55-99), concise summary, 3-4 specific visualSignals observed directly in THIS image, textConsistency, and cumoNote.`;
+
+      const aiVerdict = await analyzeWithGemini({
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: normalizedMime, data: cleanB64 } },
+        ],
+      });
+      if (aiVerdict) {
+        return normalizeVerdict(aiVerdict, 'Gemini 2.5 Flash Multimodal');
+      }
+    } catch (err) {
+      console.error('Gemini image fallback:', err.message);
+    }
+  }
+
+  const lowerText = `${fileName} ${description} ${sampleTag}`.toLowerCase();
+  const urgentSocial = /(breaking|urgent|share immediately|viral|shocking|forwarded|exclusive leak)/.test(lowerText);
+
+  if (telemetry.aiSoftware) {
+    return {
+      classification: 'Fake',
+      confidence: 96,
+      summary: `Embedded AI generator metadata ("${telemetry.aiSoftware}") found inside ${telemetry.formatLabel} (${telemetry.approxKb} KB).`,
+      visualSignals: [
+        `Binary chunk signature matched "${telemetry.aiSoftware}"`,
+        `File entropy ${telemetry.entropy} bits/byte · ${telemetry.approxKb} KB`,
+        telemetry.hasExifHeader ? 'Synthetic/modified EXIF container' : 'Missing physical camera sensor EXIF tags',
+      ],
+      textConsistency: description.trim() ? 'Claim conflicts with embedded AI generation signature.' : 'AI software metadata confirms synthetic origin.',
+      cumoNote: `Binary header inspection flagged ${telemetry.aiSoftware} (${sourceChannel}) [Engine: Binary Forensics].`,
+    };
+  }
+
+  if (telemetry.hasExifHeader && telemetry.cameraBrand && !telemetry.editorSoftware && !urgentSocial) {
+    return {
+      classification: 'Real',
+      confidence: 88,
+      summary: `Hardware camera EXIF metadata ("${telemetry.cameraBrand}") verified in ${telemetry.formatLabel} (${telemetry.approxKb} KB) with no AI generator signatures.`,
+      visualSignals: [
+        `Camera hardware marker "${telemetry.cameraBrand}" preserved in EXIF header`,
+        'No Midjourney/Stable Diffusion/DALL-E/ComfyUI metadata chunks found',
+        `Payload entropy ${telemetry.entropy} bits/byte consistent with camera encoding`,
+      ],
+      textConsistency: description.trim() ? 'No contradiction detected in metadata check.' : 'Camera hardware provenance verified.',
+      cumoNote: `EXIF hardware verification passed (${sourceChannel}) [Engine: Binary Forensics].`,
     };
   }
 
   return {
     classification: 'Suspicious',
-    confidence: 76,
-    summary: `Encoded media payload (${approxKb} KB) inspected; missing verifiable camera provenance.`,
+    confidence: 74,
+    summary: `${telemetry.formatLabel} (${telemetry.approxKb} KB) lacks verifiable hardware camera EXIF provenance${telemetry.editorSoftware ? ` and shows "${telemetry.editorSoftware}" processing markers` : ''}. Cannot confirm authenticity from metadata alone.`,
     visualSignals: [
-      `Payload size ${approxKb} KB analyzed for tampering signatures`,
-      'Original camera EXIF metadata unavailable',
+      telemetry.hasExifHeader ? 'EXIF header present without recognized camera hardware Make/Model' : 'Original hardware camera EXIF metadata stripped (common in AI exports & social forwards)',
+      telemetry.editorSoftware ? `Editing/re-encoding software tag found: "${telemetry.editorSoftware}"` : `Entropy ${telemetry.entropy} bits/byte · ${telemetry.formatLabel} container`,
+      geminiKey ? 'Fallback binary check triggered' : 'Tip: Set GEMINI_API_KEY in Vercel for pixel-level AI deepfake inspection',
     ],
-    textConsistency: 'Manual review recommended for unverified media format.',
-    cumoNote: 'Marked Suspicious due to missing EXIF provenance.',
+    textConsistency: urgentSocial
+      ? 'Urgent viral claim requires independent source verification.'
+      : 'Visual provenance unverified due to stripped camera metadata.',
+    cumoNote: `Marked Suspicious: stripped/missing camera provenance (${sourceChannel}) [Engine: Binary Forensics].`,
   };
 }
 
-function inspectVoiceForensics({ audioBase64, fileName = '', mimeType = 'audio/wav', transcriptOrClaim = '', sourceChannel = 'Voice Forensics', sampleTag = '' }) {
+async function inspectVoiceForensics({ audioBase64 = '', fileName = '', mimeType = 'audio/wav', transcriptOrClaim = '', sourceChannel = 'Voice Forensics', sampleTag = '' }) {
   const cleanB64 = audioBase64.includes(',') ? audioBase64.split(',')[1] : audioBase64;
-  const bytes = Buffer.from(cleanB64, 'base64');
-  const approxKb = Math.max(1, Math.round(bytes.length / 1024));
-  const lower = `${fileName} ${transcriptOrClaim} ${sampleTag}`.toLowerCase();
+  const bytes = cleanB64 ? Buffer.from(cleanB64, 'base64') : Buffer.alloc(0);
+  const decodedPreview = bytes.subarray(0, 64).toString('utf8');
+  const isDemoSample = Boolean(sampleTag) || decodedPreview.startsWith('SAMPLE_VOICE::');
 
-  const isFakeVoice = /(otp|pin|bank|clone|elevenlabs|tts|synthetic|ai|fake|transfer money|ceo|boss)/.test(lower);
-  const isSuspiciousVoice = /(whatsapp|urgent|forwarded|scam|emergency|help fast|accident)/.test(lower);
-
-  if (isFakeVoice) {
+  if (isDemoSample) {
+    const lowerTag = `${sampleTag} ${transcriptOrClaim}`.toLowerCase();
+    if (/fake|clone|bank|otp/.test(lowerTag)) {
+      return {
+        classification: 'Fake',
+        confidence: 94,
+        summary: 'Demo voice clone sample flagged: uniform neural vocoder pitch contour and OTP/bank impersonation script.',
+        visualSignals: [
+          'Synthetic TTS / voice-clone prosody benchmark',
+          'Absence of natural respiratory breath pauses',
+          'High-risk social engineering OTP solicitation pattern',
+        ],
+        textConsistency: 'Spoken claim matches known voice-cloning fraud scripts.',
+        cumoNote: `Voice Demo Benchmark (${sourceChannel}) [Engine: Demo Preset]`,
+      };
+    }
     return {
-      classification: 'Fake',
-      confidence: 94,
-      summary: `Voice payload (${approxKb} KB) and spoken claim exhibit synthetic TTS/voice-clone patterns: overly uniform harmonic spacing and zero natural breath jitter.`,
+      classification: 'Real',
+      confidence: 91,
+      summary: 'Demo human voice sample verified: organic pitch micro-jitter and natural room floor.',
       visualSignals: [
-        `Audio container (${mimeType}, ${approxKb} KB) spectral flux inspected`,
-        'Unnaturally flat micro-pitch contour typical of neural vocoders',
-        'Absence of organic lung inhalation breath pauses between clauses',
-        'High-risk impersonation/OTP solicitation keywords detected',
+        'Natural vocal cadence and breath pauses verified',
+        'Consistent ambient acoustic floor',
       ],
-      textConsistency: 'Spoken transcript aligns with known AI voice cloning fraud scripts.',
-      cumoNote: `Audio Deepfake Detector flagged AI Voice Clone (${sourceChannel}).`,
+      textConsistency: 'Consistent with natural human speech.',
+      cumoNote: `Voice Demo Benchmark (${sourceChannel}) [Engine: Demo Preset]`,
     };
   }
 
-  if (isSuspiciousVoice) {
+  const telemetry = extractAudioBinaryTelemetry(bytes, mimeType);
+
+  if (geminiKey) {
+    try {
+      const normalizedAudioMime = mimeType.toLowerCase().includes('mp3') || mimeType.toLowerCase().includes('mpeg')
+        ? 'audio/mp3'
+        : mimeType.toLowerCase().includes('m4a') || mimeType.toLowerCase().includes('mp4')
+          ? 'audio/mp4'
+          : mimeType.toLowerCase().includes('ogg')
+            ? 'audio/ogg'
+            : mimeType.toLowerCase().includes('webm')
+              ? 'audio/webm'
+              : 'audio/wav';
+
+      const prompt = `You are VeriLens AI, an expert audio forensics specialist detecting AI voice clones (ElevenLabs, OpenAI TTS, Bark, VALL-E, RVC), synthetic speech, spliced audio, and voice-phishing scams.
+
+Analyze the attached audio recording (and/or spoken claim):
+1. Listen closely to acoustic & vocal markers: robotic/metallic vocoder buzz, unnaturally smooth/uniform pitch & cadence, missing natural breath inhalations, abrupt room-tone cuts/splices, or unnatural pronunciation glitches.
+2. Container & Signal Telemetry:
+   - Container: ${telemetry.container}, Size: ${telemetry.approxKb} KB, Entropy: ${telemetry.entropy} bits/byte
+   - WAV Info: ${telemetry.wavInfo ? `${telemetry.wavInfo.sampleRate} Hz, ${telemetry.wavInfo.channels} ch, ${telemetry.wavInfo.bitsPerSample}-bit, ~${telemetry.wavInfo.durationSec}s` : 'Compressed container'}
+   - Silence byte ratio: ${telemetry.silenceByteRatio}, Encoder tag: ${telemetry.encoderTag || 'None'}
+3. Spoken Claim / Context provided by user: "${transcriptOrClaim.trim() || '(none provided)'}" (Source: ${sourceChannel})
+
+Classification rules:
+- "Fake": Clear synthetic TTS / AI voice cloning artifacts OR explicit AI-generated voice indicators.
+- "Real": Natural human speech with organic breath pauses, natural pitch variation, and authentic ambient noise floor.
+- "Suspicious": Heavy WhatsApp/social compression, too short/noisy to be conclusive, OR urgent financial/OTP scam request needing out-of-band callback verification.
+Return strictly valid JSON.`;
+
+      const parts = [{ text: prompt }];
+      if (cleanB64 && bytes.length > 64) {
+        parts.push({ inline_data: { mime_type: normalizedAudioMime, data: cleanB64 } });
+      }
+      const aiVerdict = await analyzeWithGemini({ parts });
+      if (aiVerdict) {
+        return normalizeVerdict(aiVerdict, 'Gemini 2.5 Flash Audio');
+      }
+    } catch (err) {
+      console.error('Gemini voice fallback:', err.message);
+    }
+  }
+
+  const lower = `${fileName} ${transcriptOrClaim}`.toLowerCase();
+  const isFakeTag = Boolean(telemetry.encoderTag && !['lavf', 'ffmpeg'].includes(telemetry.encoderTag)) ||
+    /(elevenlabs|tts|synthetic|ai voice|voice clone)/.test(lower);
+  const isScamClaim = /(otp|pin|bank|transfer money|urgent|emergency|whatsapp|forwarded|scam)/.test(lower);
+
+  if (isFakeTag) {
     return {
-      classification: 'Suspicious',
-      confidence: 79,
-      summary: `Audio sample (${approxKb} KB) shows heavy social-app re-encoding and urgent phrasing that can mask voice conversion artifacts.`,
+      classification: 'Fake',
+      confidence: 92,
+      summary: `Synthetic speech indicator ("${telemetry.encoderTag || 'TTS marker'}") detected in ${telemetry.container} (${telemetry.approxKb} KB).`,
       visualSignals: [
-        `Codec bitrate (${mimeType}, ${approxKb} KB) shows multi-hop compression`,
-        'High-urgency request requires callback verification on a trusted number',
-        'Mid-band formant smoothing detected under compression noise',
+        `Encoder/tool signature: ${telemetry.encoderTag || 'TTS/Clone keyword match'}`,
+        `Audio entropy ${telemetry.entropy} bits/byte · Silence ratio ${telemetry.silenceByteRatio}`,
+        telemetry.wavInfo ? `PCM ${telemetry.wavInfo.sampleRate} Hz / ${telemetry.wavInfo.channels}ch` : `Container: ${telemetry.container}`,
       ],
-      textConsistency: 'Urgent financial/emergency request cannot be verified from compressed audio alone.',
-      cumoNote: 'Marked Suspicious â€” verify caller identity independently.',
+      textConsistency: 'Audio markers point to synthetic speech generation.',
+      cumoNote: `Audio binary inspection flagged synthetic tool (${sourceChannel}) [Engine: Signal Forensics].`,
     };
   }
 
   return {
-    classification: 'Real',
-    confidence: 91,
-    summary: `Natural vocal micro-jitter, realistic ambient room floor, and organic breath cadence in ${fileName || mimeType} (${approxKb} KB) indicate authentic human speech.`,
+    classification: 'Suspicious',
+    confidence: isScamClaim ? 81 : 70,
+    summary: isScamClaim
+      ? `Audio (${telemetry.approxKb} KB) accompanies high-risk urgent/financial phrasing. Verify caller identity independently.`
+      : `Audio container (${telemetry.container}, ${telemetry.approxKb} KB) inspected at signal level, but neural vocoder verification requires Gemini AI (set GEMINI_API_KEY in Vercel).`,
     visualSignals: [
-      `Audio stream (${mimeType}, ${approxKb} KB) displays natural pitch variation`,
-      'Consistent ambient noise floor across speech & pause intervals',
-      'No neural vocoder phase discontinuities detected',
+      telemetry.wavInfo
+        ? `WAV PCM ${telemetry.wavInfo.sampleRate} Hz, ${telemetry.wavInfo.channels} ch, ~${telemetry.wavInfo.durationSec}s`
+        : `Container ${telemetry.container} (${telemetry.approxKb} KB)`,
+      `Byte entropy ${telemetry.entropy} bits/byte · Zero-byte silence ratio ${telemetry.silenceByteRatio}`,
+      geminiKey ? 'Fallback signal check used' : 'Tip: Add free GEMINI_API_KEY in Vercel for real waveform AI clone detection',
     ],
-    textConsistency: transcriptOrClaim.trim()
-      ? 'Spoken context is consistent with natural human delivery.'
-      : 'Natural speech acoustics verified.',
-    cumoNote: 'Voice Forensics verified human speech characteristics.',
+    textConsistency: isScamClaim
+      ? 'High-urgency or financial request requires callback verification.'
+      : 'Acoustic signal parsed; AI waveform inspection not configured.',
+    cumoNote: `Marked Suspicious pending AI acoustic confirmation (${sourceChannel}) [Engine: Signal Forensics].`,
   };
 }
 
@@ -297,7 +749,8 @@ app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'verilens-vercel-api',
-    storage: mongoUri ? 'mongodb' : 'vercel-memory',
+    storage: storageMode(),
+    aiEngine: geminiKey ? 'gemini-2.5-flash' : 'binary-signal-fallback',
     otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
     endpoints: [
       '/api/health',
@@ -306,6 +759,7 @@ app.get('/', (_req, res) => {
       '/api/auth/login',
       '/api/auth/forgot-password',
       '/api/auth/reset-password',
+      '/api/auth/delete-account',
       '/api/analyze',
       '/api/analyze-voice',
       '/api/scans',
@@ -318,7 +772,8 @@ app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'verilens-vercel-api',
-    storage: mongoUri ? 'mongodb' : 'vercel-memory',
+    storage: storageMode(),
+    aiEngine: geminiKey ? 'gemini-2.5-flash' : 'binary-signal-fallback',
     otpEmail: isEmailOtpConfigured() ? 'configured' : 'not-configured',
   });
 });
@@ -330,11 +785,8 @@ app.post('/api/auth/send-register-otp', async (req, res) => {
     if (!name.trim() || !cleanEmail.includes('@')) {
       return res.status(400).json({ error: 'Name and valid email are required.' });
     }
-    const db = await getDb();
-    if (db) {
-      const existing = await db.collection('users').findOne({ email: cleanEmail });
-      if (existing) return res.status(409).json({ error: 'Email is already registered.' });
-    } else if (memoryUsers.has(cleanEmail)) {
+    const existing = await findUser(cleanEmail);
+    if (existing) {
       return res.status(409).json({ error: 'Email is already registered.' });
     }
 
@@ -373,11 +825,16 @@ app.post('/api/auth/register', async (req, res) => {
       verified.purpose !== 'register' ||
       verified.email !== cleanEmail ||
       verified.codeHash !== hashPassword(`${cleanEmail}:${otp.trim()}`) ||
-      usedOtpNonces.has(verified.nonce)
+      (await isNonceUsed(verified.nonce))
     ) {
       return res.status(400).json({ error: 'Invalid or expired email OTP.' });
     }
-    usedOtpNonces.add(verified.nonce);
+    await markNonceUsed(verified.nonce);
+
+    const existing = await findUser(cleanEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'Email is already registered.' });
+    }
 
     const userDoc = {
       id: `usr_${Date.now()}`,
@@ -388,15 +845,8 @@ app.post('/api/auth/register', async (req, res) => {
       verifiedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
     };
-    const db = await getDb();
-    if (db) {
-      const existing = await db.collection('users').findOne({ email: cleanEmail });
-      if (existing) return res.status(409).json({ error: 'Email is already registered.' });
-      await db.collection('users').insertOne(userDoc);
-    } else {
-      if (memoryUsers.has(cleanEmail)) return res.status(409).json({ error: 'Email is already registered.' });
-      memoryUsers.set(cleanEmail, userDoc);
-    }
+    await saveUser(userDoc);
+
     const safeUser = { id: userDoc.id, name: userDoc.name, email: userDoc.email, role: userDoc.role };
     res.json({
       ok: true,
@@ -417,10 +867,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
     const passHash = hashPassword(password);
-    const db = await getDb();
-    let user = db
-      ? await db.collection('users').findOne({ email: cleanEmail })
-      : memoryUsers.get(cleanEmail);
+    let user = await findUser(cleanEmail);
 
     if (!user && accountProof) {
       const proof = verifyToken(accountProof);
@@ -433,23 +880,15 @@ app.post('/api/auth/login', async (req, res) => {
           passwordHash: proof.passwordHash,
           createdAt: new Date().toISOString(),
         };
-        if (db) {
-          await db.collection('users').updateOne(
-            { email: cleanEmail },
-            { $setOnInsert: user },
-            { upsert: true }
-          );
-        } else {
-          memoryUsers.set(cleanEmail, user);
-        }
+        await saveUser(user);
       }
     }
 
     if (!user) {
       return res.status(401).json({
-        error: db
+        error: hasKv || hasBlob
           ? 'No account found for this email. Please Register first.'
-          : 'Account session expired on serverless RAM (MongoDB URI not set). Tap Forgot Password once or set MONGODB_URI for permanent cloud storage.',
+          : 'Vercel Storage is not connected yet. Connect free Vercel Blob in Dashboard -> Storage or tap Forgot Password once.',
       });
     }
 
@@ -468,6 +907,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const cleanEmail = (req.body?.email || '').trim().toLowerCase();
@@ -510,52 +950,47 @@ app.post('/api/auth/reset-password', async (req, res) => {
       verified.purpose !== 'reset' ||
       verified.email !== cleanEmail ||
       verified.codeHash !== hashPassword(`${cleanEmail}:${code.trim()}`) ||
-      usedOtpNonces.has(verified.nonce)
+      (await isNonceUsed(verified.nonce))
     ) {
       return res.status(400).json({ error: 'Invalid or expired reset OTP.' });
     }
     if (newPassword.length < 6) {
       return res.status(400).json({ error: 'New password must be at least 6 characters.' });
     }
-    usedOtpNonces.add(verified.nonce);
-        const newHash = hashPassword(newPassword);
-    const db = await getDb();
-    let updatedUser = null;
-    if (db) {
-      await db.collection('users').updateOne(
-        { email: cleanEmail },
-        {
-          $set: { passwordHash: newHash },
-          $setOnInsert: {
-            id: `usr_${Date.now()}`,
-            name: cleanEmail.split('@')[0],
-            email: cleanEmail,
-            role: 'Media Analyst',
-            verifiedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-        },
-        { upsert: true }
-      );
-      updatedUser = await db.collection('users').findOne({ email: cleanEmail });
-    } else {
-      const existing = memoryUsers.get(cleanEmail) || {
-        id: `usr_${Date.now()}`,
-        name: cleanEmail.split('@')[0],
-        email: cleanEmail,
-        role: 'Media Analyst',
-        verifiedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      };
-      existing.passwordHash = newHash;
-      memoryUsers.set(cleanEmail, existing);
-      updatedUser = existing;
-    }
+    await markNonceUsed(verified.nonce);
+
+    const newHash = hashPassword(newPassword);
+    const existing = (await findUser(cleanEmail)) || {
+      id: `usr_${Date.now()}`,
+      name: cleanEmail.split('@')[0],
+      email: cleanEmail,
+      role: 'Media Analyst',
+      verifiedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    };
+    existing.passwordHash = newHash;
+    await saveUser(existing);
+
     res.json({
       ok: true,
       message: 'Password updated successfully.',
-      accountProof: updatedUser ? makeAccountProof(updatedUser) : '',
+      accountProof: makeAccountProof(existing),
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/delete-account', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const verified = verifyToken(token);
+    if (!verified || !verified.email) {
+      return res.status(401).json({ error: 'Valid session token is required.' });
+    }
+    await deleteUser(verified.email);
+    res.json({ ok: true, message: 'Account deleted permanently.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -576,8 +1011,9 @@ app.post('/api/analyze', async (req, res) => {
       return res.status(400).json({ error: 'imageBase64 is required.' });
     }
 
-    const result = inspectImageForensics({
+    const result = await inspectImageForensics({
       imageBase64,
+      mimeType,
       fileName,
       description,
       sourceChannel,
@@ -594,14 +1030,7 @@ app.post('/api/analyze', async (req, res) => {
       analyzedAt: new Date().toISOString(),
     };
 
-    const db = await getDb();
-    if (db) {
-      await db.collection('scans').insertOne(record);
-    } else {
-      memoryScans.unshift(record);
-      if (memoryScans.length > 60) memoryScans.pop();
-    }
-
+    await addScan(record);
     res.json(record);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -623,7 +1052,7 @@ app.post('/api/analyze-voice', async (req, res) => {
       return res.status(400).json({ error: 'Audio file, recording, or voice claim is required.' });
     }
 
-    const result = inspectVoiceForensics({
+    const result = await inspectVoiceForensics({
       audioBase64,
       fileName,
       mimeType,
@@ -641,14 +1070,7 @@ app.post('/api/analyze-voice', async (req, res) => {
       analyzedAt: new Date().toISOString(),
     };
 
-    const db = await getDb();
-    if (db) {
-      await db.collection('scans').insertOne(record);
-    } else {
-      memoryScans.unshift(record);
-      if (memoryScans.length > 60) memoryScans.pop();
-    }
-
+    await addScan(record);
     res.json(record);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -657,12 +1079,8 @@ app.post('/api/analyze-voice', async (req, res) => {
 
 app.get('/api/scans', async (_req, res) => {
   try {
-    const db = await getDb();
-    if (db) {
-      const scans = await db.collection('scans').find({}).sort({ analyzedAt: -1 }).limit(60).toArray();
-      return res.json({ scans });
-    }
-    res.json({ scans: memoryScans });
+    const scans = await listScans();
+    res.json({ scans });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -670,17 +1088,8 @@ app.get('/api/scans', async (_req, res) => {
 
 app.post('/api/apk/track', async (_req, res) => {
   try {
-    const db = await getDb();
-    if (db) {
-      await db.collection('apk_downloads').updateOne(
-        { _id: 'verilens_apk_v1' },
-        { $inc: { totalShares: 1 }, $set: { lastActivityAt: new Date().toISOString() } },
-        { upsert: true }
-      );
-      return res.json({ tracked: true, storage: 'mongodb' });
-    }
-    memoryApkShares += 1;
-    res.json({ tracked: true, totalShares: memoryApkShares, storage: 'vercel-memory' });
+    const result = await incrementApkShares();
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

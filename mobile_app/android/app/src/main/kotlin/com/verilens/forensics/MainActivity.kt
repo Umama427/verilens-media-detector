@@ -1,4 +1,4 @@
-package com.example.media_verify_ai
+package com.verilens.forensics
 
 import android.Manifest
 import android.app.Activity
