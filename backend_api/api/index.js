@@ -47,7 +47,7 @@ const geminiKey = process.env.GEMINI_API_KEY || '';
 const aiClient = geminiKey ? new GoogleGenAI({ apiKey: geminiKey }) : null;
 const authSecret = process.env.AUTH_SECRET || 'verilens-stateless-forensic-key';
 
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+const GEMINI_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 
 let blobAccess = 'private';
 const memoryScans = [];
@@ -502,7 +502,17 @@ async function inspectImageForensics({ imageBase64, mimeType = 'image/jpeg', fil
   const cleanB64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
   const bytes = Buffer.from(cleanB64, 'base64');
   const decodedPreview = bytes.subarray(0, 64).toString('utf8');
-  const isDemoSample = Boolean(sampleTag) || decodedPreview.startsWith('SAMPLE_MEDIA::');
+  const isTextOnlySocial = Boolean(sampleTag && sampleTag.startsWith('social_'));
+  if (isTextOnlySocial && aiClient && description.trim()) {
+    try {
+      const socialPrompt = `You are VeriLens AI Social Guard. Analyze this forwarded ${sourceChannel} message/claim for misinformation, urgency scams, phishing, synthetic media claims, or fabrication:\n\nClaim: "${description.trim()}"\n\nReturn JSON strictly with classification ("Real" | "Fake" | "Suspicious"), integer confidence (60-99), summary, 3 visualSignals (verification signals), textConsistency, and cumoNote.`;
+      const { parsed, model } = await analyzeWithGemini([{ text: socialPrompt }]);
+      return normalizeVerdict(parsed, `Gemini Social Guard (${model})`);
+    } catch (err) {
+      console.error('Social Guard AI fallback:', err?.message || err);
+    }
+  }
+  const isDemoSample = !isTextOnlySocial && (Boolean(sampleTag) || decodedPreview.startsWith('SAMPLE_MEDIA::'));
 
   if (isDemoSample) {
     const lowerTag = `${sampleTag} ${fileName} ${description}`.toLowerCase();
